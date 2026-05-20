@@ -1,0 +1,5 @@
+host=10.10.199.12
+port=22
+user=ubuntu
+key=link3-deploy.pem
+private_ip=10.10.199.12

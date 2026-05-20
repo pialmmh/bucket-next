@@ -1,0 +1,10 @@
+bin/
+data/
+configs/dev.yaml
+configs/*.local.yaml
+
+# SSH inventory — private keys never leave the machine.
+deploy/ssh-inventory/**/keys/*.pem
+deploy/ssh-inventory/**/keys/*.key
+deploy/ssh-inventory/**/keys/id_*
+!deploy/ssh-inventory/**/keys/.gitkeep

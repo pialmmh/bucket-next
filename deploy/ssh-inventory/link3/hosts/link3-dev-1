@@ -1,0 +1,8 @@
+# Sample host file. Replace with real values before first deploy.
+host=10.10.199.11
+port=22
+user=ubuntu
+key=link3-deploy.pem
+private_ip=10.10.199.11
+# Optional override — uncomment to bind a non-default port on this host
+#listen_port_override=7011

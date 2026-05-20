@@ -1,0 +1,6 @@
+host=10.10.198.5
+port=22
+user=ubuntu
+key=tcteltd-deploy.pem
+private_ip=10.10.198.5
+listen_port_override=7002

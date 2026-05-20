@@ -1,0 +1,1 @@
+Drop private SSH keys here. Mode 0600. *.pem and *.key are gitignored.

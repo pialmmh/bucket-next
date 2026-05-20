@@ -1,0 +1,7 @@
+host=10.10.198.5
+port=22
+user=ubuntu
+key=tcteltd-deploy.pem
+private_ip=10.10.198.5
+# Two shards on one box — give each shard a unique port.
+listen_port_override=7001

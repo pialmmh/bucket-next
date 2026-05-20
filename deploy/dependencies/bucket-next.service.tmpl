@@ -1,0 +1,25 @@
+[Unit]
+Description=bucket-next ID Service (tenant=__TENANT__ profile=__PROFILE__ shard=__SHARD_ID__/__TOTAL_SHARDS__)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bucket-next
+Group=bucket-next
+ExecStart=/opt/bucket-next/bucket-next -config /opt/bucket-next/config.yaml
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/bucket-next
+
+[Install]
+WantedBy=multi-user.target
