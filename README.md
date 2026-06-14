@@ -4,6 +4,17 @@ A sharded, multi-type unique-ID service. Single Go binary, one YAML config, segm
 
 See the design notes in Trilium (`ID-Land` and its children) for the full feature story. This file is the quick-start.
 
+## Documentation
+
+Full guides live in [`docs/`](docs/) — followable cold by a human or another agent:
+
+- [docs/getting-started.md](docs/getting-started.md) — clone, build, run, first ID
+- [docs/usage-examples.md](docs/usage-examples.md) — recipes per data type, batches, language snippets
+- [docs/api-reference.md](docs/api-reference.md) — all 11 HTTP endpoints
+- [docs/configuration.md](docs/configuration.md) — every config key
+- [docs/cli.md](docs/cli.md) — `bucket-next-cli`
+- [docs/deployment.md](docs/deployment.md) — multi-node deploy with `deploy.sh`
+
 ## Build
 
 ```
