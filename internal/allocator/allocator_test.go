@@ -1,381 +1,350 @@
 package allocator
 
 import (
+	"errors"
+	"math/rand"
 	"path/filepath"
-	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/telcobright/bucket-next/internal/datatype"
 	"github.com/telcobright/bucket-next/internal/state"
+	"github.com/telcobright/bucket-next/internal/testutil"
 )
 
-func mustStore(t *testing.T) *state.Store {
+func testIdentity(shardID, total int) state.Identity {
+	return state.Identity{ShardID: shardID, TotalShards: total, UUIDKeyFingerprint: "fp", SnowflakeEpochMs: 1}
+}
+
+func newStore(t *testing.T, shardID, total int) (*state.Store, string) {
 	t.Helper()
-	s, err := state.Open(filepath.Join(t.TempDir(), "s.json"))
+	path := filepath.Join(testutil.TempDir(t), "s.json")
+	st, err := state.Create(path, testIdentity(shardID, total))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s
+	return st, path
 }
 
-func registerNumeric(t *testing.T, st *state.Store, name string, dt datatype.DataType, shardID int) {
+func newAlloc(t *testing.T, st *state.Store, shardID, total, segment int, watermark float64) *Allocator {
 	t.Helper()
-	if err := st.Put(state.Record{EntityName: name, DataType: dt, CurrentIteration: 0, ShardID: shardID}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// newAlloc is a test helper that auto-closes the allocator (waits for refill goroutines)
-// when the test finishes — preventing temp-state-file races in t.TempDir cleanup.
-func newAlloc(t *testing.T, cfg Config) *Allocator {
-	t.Helper()
-	a := New(cfg)
+	a := New(Config{ShardID: shardID, TotalShards: total, SegmentSize: segment, Watermark: watermark, Store: st})
 	t.Cleanup(a.Close)
 	return a
 }
 
-// ---------- math helpers ----------
-
-func TestComputeValue_inverse(t *testing.T) {
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 100, Watermark: 0.9, Store: mustStore(t)})
-	for iter := int64(0); iter < 1000; iter++ {
-		v := a.ComputeValue(iter)
-		back := a.IterFromValue(v)
-		if back != iter {
-			t.Errorf("iter %d: ComputeValue=%d, IterFromValue=%d", iter, v, back)
-		}
+func register(t *testing.T, st *state.Store, name string, dt datatype.DataType, startIter int64) {
+	t.Helper()
+	if _, _, err := st.Register(name, dt, startIter); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestSnapForward_shard2of3(t *testing.T) {
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 100, Watermark: 0.9, Store: mustStore(t)})
-	cases := map[int64]int64{
-		0:    2,    // residue 0 → snap to 2
-		1:    2,    // residue 1 → snap to 2
-		2:    2,    // residue 2 → already valid
-		3:    5,    // residue 0 → snap to 5
-		1000: 1001, // residue 1 → snap to 1001
-		1001: 1001, // already valid
-		5000: 5000, // residue 2 → already valid
-	}
-	for in, want := range cases {
-		if got := a.SnapForward(in); got != want {
-			t.Errorf("SnapForward(%d)=%d, want %d", in, got, want)
-		}
-	}
+func mark(st *state.Store, name string) int64 {
+	r, _ := st.Get(name)
+	return r.CurrentIteration
 }
 
-func TestSnapForward_shard1of3(t *testing.T) {
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 3, SegmentSize: 100, Watermark: 0.9, Store: mustStore(t)})
-	cases := map[int64]int64{
-		0:    1, // residue 0 → snap to 1
-		1:    1, // already valid
-		2:    4, // residue 2 → snap to 4
-		4:    4, // already valid
-		7:    7,
-		5000: 5002, // 5000%3=2 → 5002 (residue 1)
-	}
-	for in, want := range cases {
-		if got := a.SnapForward(in); got != want {
-			t.Errorf("SnapForward(%d)=%d, want %d", in, got, want)
-		}
-	}
-}
+// ---------- values ----------
 
-// ---------- NextID core ----------
-
-func TestNextID_shard2of3_emitsInterleavedPattern(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "cdr", datatype.Long, 2)
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.9, Store: st})
-
+func TestNext_shard2of3_interleaved(t *testing.T) {
+	st, _ := newStore(t, 2, 3)
+	register(t, st, "cdr", datatype.Long, 0)
+	a := newAlloc(t, st, 2, 3, 10, 0.9)
 	want := []int64{2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41}
 	for i, w := range want {
-		got, err := a.NextID("cdr", datatype.Long)
-		if err != nil {
-			t.Fatalf("NextID #%d: %v", i, err)
-		}
-		if got != w {
-			t.Errorf("NextID #%d = %d, want %d", i, got, w)
-		}
-	}
-}
-
-func TestNextID_shard1of1_emits1to12(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Int, 1)
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 5, Watermark: 0.9, Store: st})
-
-	for i := int64(1); i <= 12; i++ {
-		got, err := a.NextID("x", datatype.Int)
+		first, err := a.Next("cdr", datatype.Long, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != i {
-			t.Errorf("NextID #%d = %d, want %d", i, got, i)
+		if got := a.Layout().Value(first); got != w {
+			t.Errorf("#%d = %d, want %d", i, got, w)
 		}
 	}
 }
 
-func TestNextID_shard3of3_emitsThirdResidue(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 3)
-	a := newAlloc(t, Config{ShardID: 3, TotalShards: 3, SegmentSize: 5, Watermark: 0.9, Store: st})
-
-	want := []int64{3, 6, 9, 12, 15, 18, 21}
-	for i, w := range want {
-		got, _ := a.NextID("x", datatype.Long)
-		if got != w {
-			t.Errorf("NextID #%d = %d, want %d", i, got, w)
+func TestNext_shard1of1_sequential(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "x", datatype.Int, 0)
+	a := newAlloc(t, st, 1, 1, 5, 0.9)
+	for want := int64(1); want <= 12; want++ {
+		first, _ := a.Next("x", datatype.Int, 1)
+		if got := a.Layout().Value(first); got != want {
+			t.Errorf("got %d, want %d", got, want)
 		}
 	}
 }
 
-// ---------- error paths ----------
-
-func TestNextID_typeMismatch(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 1)
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 5, Watermark: 0.9, Store: st})
-	if _, err := a.NextID("x", datatype.Int); err == nil {
-		t.Error("expected type-mismatch error")
+func TestNext_errors(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "x", datatype.Long, 0)
+	a := newAlloc(t, st, 1, 1, 5, 0.9)
+	if _, err := a.Next("missing", datatype.Long, 1); !errors.Is(err, ErrUnknownEntity) {
+		t.Errorf("unknown entity: %v", err)
+	}
+	if _, err := a.Next("x", datatype.Int, 1); err == nil {
+		t.Error("type mismatch must fail")
+	}
+	if _, err := a.Next("x", datatype.Snowflake, 1); err == nil {
+		t.Error("snowflake is not counter-based")
+	}
+	if _, err := a.Next("x", datatype.Long, 0); err == nil {
+		t.Error("count 0 must fail")
 	}
 }
 
-func TestNextID_unknownEntity(t *testing.T) {
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 5, Watermark: 0.9, Store: mustStore(t)})
-	if _, err := a.NextID("missing", datatype.Long); err == nil {
-		t.Error("expected error for unregistered entity")
+func TestNext_exhaustedHandsOutNothing(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	// Value = 1 + iter, so iter MaxInt-3 is value MaxInt-2: room for exactly 3 more ints.
+	register(t, st, "x", datatype.Int, datatype.MaxInt-3)
+	a := newAlloc(t, st, 1, 1, 5, 0.9)
+	if _, err := a.Next("x", datatype.Int, 4); !errors.Is(err, ErrExhausted) {
+		t.Fatalf("4 more must not fit: %v", err)
+	}
+	first, err := a.Next("x", datatype.Int, 3)
+	if err != nil {
+		t.Fatalf("3 more must still fit (nothing was consumed): %v", err)
+	}
+	if v := a.Layout().Value(first + 2); v != datatype.MaxInt {
+		t.Errorf("last value %d, want MaxInt", v)
+	}
+	if _, err := a.Next("x", datatype.Int, 1); !errors.Is(err, ErrExhausted) {
+		t.Errorf("past MaxInt: %v", err)
 	}
 }
 
-func TestNextID_intOverflow(t *testing.T) {
-	st := mustStore(t)
-	// Single shard, start near the int max.
-	st.Put(state.Record{EntityName: "x", DataType: datatype.Int, CurrentIteration: datatype.MaxInt - 2, ShardID: 1})
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 5, Watermark: 0.9, Store: st})
-
-	// First two should still fit, then overflow on the third.
-	_, err1 := a.NextID("x", datatype.Int)
-	_, err2 := a.NextID("x", datatype.Int)
-	_, err3 := a.NextID("x", datatype.Int)
-	if err1 != nil || err2 != nil {
-		t.Fatalf("first two should succeed: %v %v", err1, err2)
+func TestNext_uuid8Capacity(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "u", datatype.UUID8, datatype.MaxUUID8-1) // value MaxUUID8
+	a := newAlloc(t, st, 1, 1, 5, 0.9)
+	if _, err := a.Next("u", datatype.UUID8, 1); err != nil {
+		t.Fatalf("last uuid8 value must fit: %v", err)
 	}
-	if err3 == nil || !strings.Contains(err3.Error(), "overflow") {
-		t.Errorf("expected overflow on third, got %v", err3)
+	if _, err := a.Next("u", datatype.UUID8, 1); !errors.Is(err, ErrExhausted) {
+		t.Errorf("want ErrExhausted, got %v", err)
 	}
 }
 
-// ---------- segment caching ----------
+// ---------- reservations ----------
 
-func TestSegmentCaching_oneDiskWritePerSegment(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 2)
-	// Watermark 0.99 means refill won't trigger until segment is nearly drained.
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 5, Watermark: 0.99, Store: st})
-
-	// First emission reserves segment [0, 5) on disk → CurrentIteration=5.
-	a.NextID("x", datatype.Long)
-	rec, _ := st.Get("x")
-	if rec.CurrentIteration != 5 {
-		t.Errorf("after 1 emit, disk=%d, want 5", rec.CurrentIteration)
+func TestReservation_oneDiskWritePerSegment(t *testing.T) {
+	st, _ := newStore(t, 2, 3)
+	register(t, st, "x", datatype.Long, 0)
+	a := newAlloc(t, st, 2, 3, 10, 0.5) // refill when <= 5 remain
+	a.Next("x", datatype.Long, 1)
+	if m := mark(st, "x"); m != 10 {
+		t.Fatalf("first call should reserve one segment: mark=%d", m)
 	}
-
-	// Three more emissions still within segment — disk unchanged.
 	for i := 0; i < 3; i++ {
-		a.NextID("x", datatype.Long)
+		a.Next("x", datatype.Long, 1)
 	}
-	rec, _ = st.Get("x")
-	if rec.CurrentIteration != 5 {
-		t.Errorf("after 4 emits, disk=%d, want 5 (still one segment)", rec.CurrentIteration)
+	if m := mark(st, "x"); m != 10 {
+		t.Errorf("4 IDs out, 6 remain: no refill yet, mark=%d", m)
+	}
+	a.Next("x", datatype.Long, 1) // 5 remain -> background refill
+	a.Close()
+	if m := mark(st, "x"); m != 20 {
+		t.Errorf("refill should have landed: mark=%d, want 20", m)
 	}
 }
 
-func TestSegmentRefill_advancesDiskInBackground(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 1)
-	// Watermark 0.5 means refill at iteration 5 of 10.
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 10, Watermark: 0.5, Store: st})
+func TestBatch_contiguousAcrossSegments(t *testing.T) {
+	st, _ := newStore(t, 2, 3)
+	register(t, st, "x", datatype.Long, 0)
+	a := newAlloc(t, st, 2, 3, 10, 0.9)
+	first, err := a.Next("x", datatype.Long, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0 {
+		t.Errorf("first iteration %d, want 0", first)
+	}
+	if m := mark(st, "x"); m < 25 {
+		t.Errorf("mark %d must cover the 25 handed out", m)
+	}
+	next, _ := a.Next("x", datatype.Long, 1)
+	if next != 25 {
+		t.Errorf("after a batch of 25 the next iteration is %d, want 25", next)
+	}
+}
 
-	// 5 emissions: still under watermark.
+func TestRestart_forfeitsTailNeverRepeats(t *testing.T) {
+	st, path := newStore(t, 2, 3)
+	register(t, st, "x", datatype.Long, 0)
+	a := New(Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.99, Store: st})
+	for i := 0; i < 4; i++ {
+		a.Next("x", datatype.Long, 1)
+	}
+	a.Close()
+	if m := mark(st, "x"); m != 10 {
+		t.Fatalf("pre-crash mark=%d, want 10", m)
+	}
+	st2, err := state.Open(path, testIdentity(2, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2 := newAlloc(t, st2, 2, 3, 10, 0.99)
+	first, _ := a2.Next("x", datatype.Long, 1)
+	if first != 10 || a2.Layout().Value(first) != 32 {
+		t.Errorf("after restart: iter %d value %d, want iter 10 value 32", first, a2.Layout().Value(first))
+	}
+}
+
+// ---------- the bug this rewrite fixes ----------
+
+// TestConcurrent_everyIterationExactlyOnce hammers one entity from many goroutines with tiny
+// segments, so background refills overlap inline reservations constantly. Some goroutines
+// also reset the counter forward. Every iteration handed out must be unique.
+func TestConcurrent_everyIterationExactlyOnce(t *testing.T) {
+	for _, tc := range []struct {
+		segment   int
+		watermark float64
+		resets    bool
+	}{{7, 0.5, false}, {1, 0.9, false}, {10, 0.5, true}, {1000, 0.9, false}} {
+		st, _ := newStore(t, 1, 1)
+		register(t, st, "x", datatype.Long, 0)
+		a := New(Config{ShardID: 1, TotalShards: 1, SegmentSize: tc.segment, Watermark: tc.watermark, Store: st})
+
+		var mu sync.Mutex
+		seen := map[int64]bool{}
+		var dup int64 = -1
+		var wg sync.WaitGroup
+		for g := 0; g < 32; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(g)))
+				for i := 0; i < 400; i++ {
+					if tc.resets && g == 0 && i%50 == 0 {
+						snap, _ := a.Snapshot("x")
+						a.Reset("x", snap.NextIteration+int64(rng.Intn(30)), false)
+						continue
+					}
+					n := int64(1 + rng.Intn(40))
+					first, err := a.Next("x", datatype.Long, n)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					mu.Lock()
+					for it := first; it < first+n; it++ {
+						if seen[it] {
+							dup = it
+						}
+						seen[it] = true
+					}
+					mu.Unlock()
+				}
+			}(g)
+		}
+		wg.Wait()
+		a.Close()
+		if dup >= 0 {
+			t.Fatalf("segment=%d watermark=%v resets=%v: iteration %d issued twice",
+				tc.segment, tc.watermark, tc.resets, dup)
+		}
+		var maxIt int64
+		for it := range seen {
+			if it > maxIt {
+				maxIt = it
+			}
+		}
+		if m := mark(st, "x"); m <= maxIt {
+			t.Fatalf("durable mark %d must be above every issued iteration (max %d)", m, maxIt)
+		}
+		if !tc.resets && int64(len(seen)) != maxIt+1 {
+			t.Errorf("segment=%d: %d issued but max is %d — gaps without a restart", tc.segment, len(seen), maxIt)
+		}
+	}
+}
+
+func TestConcurrent_entitiesAreIndependent(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	names := []string{"a", "b", "c", "d"}
+	for _, n := range names {
+		register(t, st, n, datatype.Long, 0)
+	}
+	a := newAlloc(t, st, 1, 1, 5, 0.5)
+	var wg sync.WaitGroup
+	counts := make([]int64, len(names))
+	for i, n := range names {
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func(i int, n string) {
+				defer wg.Done()
+				for k := 0; k < 250; k++ {
+					a.Next(n, datatype.Long, 1)
+				}
+			}(i, n)
+		}
+		counts[i] = 1000
+	}
+	wg.Wait()
+	for i, n := range names {
+		snap, _ := a.Snapshot(n)
+		if snap.NextIteration != counts[i] {
+			t.Errorf("%s: next iteration %d, want %d", n, snap.NextIteration, counts[i])
+		}
+	}
+}
+
+// ---------- reset ----------
+
+func TestReset_forwardBackwardForce(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "x", datatype.Long, 0)
+	a := newAlloc(t, st, 1, 1, 10, 0.9)
 	for i := 0; i < 5; i++ {
-		a.NextID("x", datatype.Long)
+		a.Next("x", datatype.Long, 1) // iterations 0..4 issued
 	}
-	// 6th crosses 0.5 → triggers async refill.
-	a.NextID("x", datatype.Long)
-
-	// Wait up to 500 ms for the background worker to finish.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		rec, _ := st.Get("x")
-		if rec.CurrentIteration >= 20 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	if _, err := a.Reset("x", 3, false); !errors.Is(err, ErrBackward) {
+		t.Fatalf("backward reset must be refused: %v", err)
 	}
-	rec, _ := st.Get("x")
-	t.Errorf("refill never landed; disk=%d, want >= 20", rec.CurrentIteration)
+	if prev, err := a.Reset("x", 7, false); err != nil || prev != 5 {
+		t.Fatalf("forward reset inside the window: prev=%d err=%v", prev, err)
+	}
+	if first, _ := a.Next("x", datatype.Long, 1); first != 7 {
+		t.Errorf("after reset to 7: %d", first)
+	}
+	if _, err := a.Reset("x", 2, true); err != nil {
+		t.Fatalf("forced backward reset: %v", err)
+	}
+	if first, _ := a.Next("x", datatype.Long, 1); first != 2 {
+		t.Errorf("after forced reset to 2: %d", first)
+	}
 }
 
-// ---------- batch ----------
-
-func TestNextBatch_smallFitsInSegment(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 2)
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 100, Watermark: 0.9, Store: st})
-
-	batch, err := a.NextBatch("x", datatype.Long, 5)
-	if err != nil {
+func TestReset_floorIsDiskMarkWhenNotLoaded(t *testing.T) {
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "x", datatype.Long, 50) // an earlier process may have issued up to 49
+	a := newAlloc(t, st, 1, 1, 10, 0.9)
+	if _, err := a.Reset("x", 40, false); !errors.Is(err, ErrBackward) {
+		t.Fatalf("reset below the disk mark must be refused: %v", err)
+	}
+	if _, err := a.Reset("x", 60, false); err != nil {
 		t.Fatal(err)
 	}
-	want := []int64{2, 5, 8, 11, 14}
-	if len(batch) != 5 {
-		t.Fatalf("len=%d, want 5", len(batch))
-	}
-	for i, v := range batch {
-		if v != want[i] {
-			t.Errorf("batch[%d]=%d, want %d", i, v, want[i])
-		}
+	if m := mark(st, "x"); m != 60 {
+		t.Errorf("mark=%d, want 60", m)
 	}
 }
 
-func TestNextBatch_largeReservesSegmentsInline(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 2)
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.9, Store: st})
-
-	batch, err := a.NextBatch("x", datatype.Long, 25)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(batch) != 25 {
-		t.Errorf("len=%d, want 25", len(batch))
-	}
-	// Pattern check: 2, 5, 8, …
-	for i, v := range batch {
-		want := int64(2 + i*3)
-		if v != want {
-			t.Errorf("batch[%d]=%d, want %d", i, v, want)
-			break
-		}
-	}
-	// Disk must have advanced to cover at least the 25 emitted iterations.
-	rec, _ := st.Get("x")
-	if rec.CurrentIteration < 25 {
-		t.Errorf("disk=%d, want >= 25", rec.CurrentIteration)
-	}
-}
-
-func TestNextBatch_followedByNextID_continues(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 1)
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 10, Watermark: 0.9, Store: st})
-
-	batch, _ := a.NextBatch("x", datatype.Long, 5)
-	if batch[4] != 5 {
-		t.Errorf("batch end=%d, want 5", batch[4])
-	}
-	next, _ := a.NextID("x", datatype.Long)
-	if next != 6 {
-		t.Errorf("after batch, NextID=%d, want 6", next)
-	}
-}
-
-// ---------- restart safety ----------
-
-func TestRestartSafety_resumesFromDisk_withForfeitedTail(t *testing.T) {
-	statePath := filepath.Join(t.TempDir(), "s.json")
-	// First lifetime: emit 4 IDs in a 10-size segment, then "crash".
-	{
-		st, _ := state.Open(statePath)
-		st.Put(state.Record{EntityName: "x", DataType: datatype.Long, CurrentIteration: 0, ShardID: 2})
-		a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.99, Store: st})
-		for i := 0; i < 4; i++ {
-			a.NextID("x", datatype.Long)
-		}
-		// Disk should be at 10 (one segment reserved); RAM cursor at 4.
-		rec, _ := st.Get("x")
-		if rec.CurrentIteration != 10 {
-			t.Fatalf("pre-crash disk=%d, want 10", rec.CurrentIteration)
-		}
-	}
-	// Second lifetime: fresh process. Disk says 10 → next emission must be iter 10 → value 32.
-	st2, _ := state.Open(statePath)
-	a2 := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.99, Store: st2})
-	got, err := a2.NextID("x", datatype.Long)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != 32 {
-		t.Errorf("post-restart NextID=%d, want 32 (iter 10, 5 iters forfeited)", got)
-	}
-}
-
-// ---------- introspection ----------
-
-func TestCurrentValueAndNextValue(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 2)
-	a := newAlloc(t, Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.9, Store: st})
-
-	// Before any emission.
-	if _, ok := a.CurrentValue("x"); ok {
-		t.Error("CurrentValue should be absent before first emission")
-	}
-	if v, ok := a.NextValue("x"); !ok || v != 2 {
-		t.Errorf("NextValue pre-emit = (%d, %v), want (2, true)", v, ok)
-	}
-
-	a.NextID("x", datatype.Long)
-	if v, ok := a.CurrentValue("x"); !ok || v != 2 {
-		t.Errorf("CurrentValue after 1 emit = (%d, %v), want (2, true)", v, ok)
-	}
-	if v, _ := a.NextValue("x"); v != 5 {
-		t.Errorf("NextValue after 1 emit = %d, want 5", v)
-	}
-}
+// ---------- snapshot ----------
 
 func TestSnapshot(t *testing.T) {
-	st := mustStore(t)
-	registerNumeric(t, st, "x", datatype.Long, 1)
-	a := newAlloc(t, Config{ShardID: 1, TotalShards: 1, SegmentSize: 10, Watermark: 0.9, Store: st})
-
-	// No in-RAM segment yet.
-	if _, err := a.Snapshot("x"); err == nil {
-		t.Error("Snapshot before emission should error")
-	}
-	a.NextID("x", datatype.Long)
+	st, _ := newStore(t, 1, 1)
+	register(t, st, "x", datatype.Long, 0)
+	a := newAlloc(t, st, 1, 1, 10, 0.5)
 	snap, err := a.Snapshot("x")
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || snap.Loaded || snap.NextIteration != 0 {
+		t.Fatalf("before use: %+v %v", snap, err)
 	}
-	if snap.Size != 10 {
-		t.Errorf("Size=%d, want 10", snap.Size)
+	a.Next("x", datatype.Long, 3)
+	snap, _ = a.Snapshot("x")
+	if !snap.Loaded || snap.Issued != 3 || snap.NextIteration != 3 || snap.Remaining != 7 || snap.DiskMark != 10 {
+		t.Errorf("after 3: %+v", snap)
 	}
-	if snap.Cursor != 1 {
-		t.Errorf("Cursor=%d, want 1", snap.Cursor)
-	}
-	if snap.Remaining != 9 {
-		t.Errorf("Remaining=%d, want 9", snap.Remaining)
-	}
-}
-
-// ---------- overflow guard ----------
-
-func TestCheckOverflow(t *testing.T) {
-	if err := CheckOverflow(datatype.Int, datatype.MaxInt); err != nil {
-		t.Errorf("MaxInt itself should not overflow: %v", err)
-	}
-	if err := CheckOverflow(datatype.Int, datatype.MaxInt+1); err == nil {
-		t.Error("MaxInt+1 should overflow int")
-	}
-	if err := CheckOverflow(datatype.Long, datatype.MaxLong); err != nil {
-		t.Errorf("MaxLong itself should not overflow: %v", err)
-	}
-	// snowflake / uuid never overflow via this function.
-	if err := CheckOverflow(datatype.Snowflake, datatype.MaxLong); err != nil {
-		t.Errorf("snowflake should not be subject to overflow checks: %v", err)
+	if _, err := a.Snapshot("missing"); !errors.Is(err, ErrUnknownEntity) {
+		t.Errorf("missing: %v", err)
 	}
 }

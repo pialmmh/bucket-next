@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/telcobright/bucket-next/internal/config"
 	"github.com/telcobright/bucket-next/internal/forge"
 	"github.com/telcobright/bucket-next/internal/state"
+	"github.com/telcobright/bucket-next/internal/uuidgen"
 )
 
 type Server struct {
@@ -18,23 +18,25 @@ type Server struct {
 	state     *state.Store
 	forge     *forge.Forge
 	allocator *allocator.Allocator
+	codec     *uuidgen.Codec
 	startedAt time.Time
 	mux       *http.ServeMux
 	httpsrv   *http.Server
 }
 
-func New(cfg *config.Config, st *state.Store, f *forge.Forge, alloc *allocator.Allocator) *Server {
+func New(cfg *config.Config, st *state.Store, f *forge.Forge, alloc *allocator.Allocator, codec *uuidgen.Codec) *Server {
 	s := &Server{
 		cfg:       cfg,
 		state:     st,
 		forge:     f,
 		allocator: alloc,
+		codec:     codec,
 		startedAt: time.Now(),
 		mux:       http.NewServeMux(),
 	}
 	s.routes()
 	s.httpsrv = &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.ListenPort),
+		Addr:              cfg.ListenAddr(),
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -56,9 +58,14 @@ func (s *Server) routes() {
 }
 
 func (s *Server) ListenAndServe() error {
-	log.Printf("bucket-next listening on :%d  shard=%d/%d  state=%s",
-		s.cfg.ListenPort, s.cfg.ShardID, s.cfg.TotalShards, s.cfg.StatePath)
+	log.Printf("bucket-next listening on %s  shard=%d/%d  state=%s",
+		s.httpsrv.Addr, s.cfg.ShardID, s.cfg.TotalShards, s.cfg.StatePath)
 	return s.httpsrv.ListenAndServe()
+}
+
+// Addr is the address ListenAndServe binds.
+func (s *Server) Addr() string {
+	return s.httpsrv.Addr
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

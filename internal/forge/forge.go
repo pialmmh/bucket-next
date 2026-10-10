@@ -17,8 +17,8 @@ const (
 	maxShardID  = 1<<ShardIDBits - 1  // 1023 (0-based)
 	maxSequence = 1<<SequenceBits - 1 // 4095
 
-	shardIDShift   = SequenceBits                // 12
-	timestampShift = SequenceBits + ShardIDBits  // 22
+	shardIDShift   = SequenceBits               // 12
+	timestampShift = SequenceBits + ShardIDBits // 22
 )
 
 // Forge mints 64-bit Snowflake IDs for one shard.
@@ -31,6 +31,13 @@ type Forge struct {
 	lastTimestamp int64
 	sequence      int64
 
+	// Restart safety (see EnableMark). persist saves a lease: a timestamp the forge will not
+	// pass without saving a new one first. After a restart the forge waits until the clock
+	// is past the last lease, so it can never reuse a (timestamp, sequence) pair.
+	persist    func(ms int64) error
+	leaseMs    int64
+	leaseUntil int64
+
 	generated  atomic.Int64
 	collisions atomic.Int64
 	waits      atomic.Int64
@@ -38,12 +45,12 @@ type Forge struct {
 
 // Info is the metadata reported by /api/types.
 type Info struct {
-	ShardID        int               `json:"shardId"`
-	TotalShards    int               `json:"totalShards"`
-	Epoch          string            `json:"epoch"`
-	MaxIdsPerMs    int               `json:"maxIdsPerMs"`
-	MaxShards      int               `json:"maxShards"`
-	BitsAllocation map[string]int    `json:"bitsAllocation"`
+	ShardID        int            `json:"shardId"`
+	TotalShards    int            `json:"totalShards"`
+	Epoch          string         `json:"epoch"`
+	MaxIdsPerMs    int            `json:"maxIdsPerMs"`
+	MaxShards      int            `json:"maxShards"`
+	BitsAllocation map[string]int `json:"bitsAllocation"`
 }
 
 // Parsed is the decoded form of a Snowflake ID.
@@ -68,11 +75,41 @@ func New(shardID int, epochMs, clockDriftTolMs int64) (*Forge, error) {
 	}, nil
 }
 
+// DefaultLeaseMs is how far ahead of the clock the persisted Snowflake mark is kept.
+const DefaultLeaseMs = 1000
+
+// EnableMark makes the forge safe across restarts. markMs is the persisted mark from earlier
+// runs (0 if none). The forge waits until the clock passes it — at most one lease plus the
+// clock drift tolerance — and from then on persists a lease before using any timestamp.
+func (f *Forge) EnableMark(markMs int64, persist func(ms int64) error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if markMs > 0 {
+		behind := markMs - nowMs()
+		if limit := DefaultLeaseMs + f.clockDriftTolMs; behind > limit {
+			return fmt.Errorf("clock is %d ms behind the last persisted snowflake mark (allowed %d ms); "+
+				"refusing to start so no Snowflake ID repeats — fix the clock or raise clock_drift_tolerance_ms", behind, limit)
+		}
+		for nowMs() <= markMs {
+			time.Sleep(time.Millisecond)
+		}
+		if markMs > f.lastTimestamp {
+			f.lastTimestamp = markMs
+		}
+	}
+	f.persist = persist
+	f.leaseMs = DefaultLeaseMs
+	return nil
+}
+
 // Generate returns one Snowflake ID as a decimal string.
 func (f *Forge) Generate() (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.generateLocked()
+}
 
+func (f *Forge) generateLocked() (string, error) {
 	ts := nowMs()
 	if ts < f.lastTimestamp {
 		drift := f.lastTimestamp - ts
@@ -97,17 +134,27 @@ func (f *Forge) Generate() (string, error) {
 		f.sequence = 0
 	}
 
+	if f.persist != nil && ts >= f.leaseUntil {
+		lease := ts + f.leaseMs
+		if err := f.persist(lease); err != nil {
+			return "", fmt.Errorf("persist snowflake mark: %w", err)
+		}
+		f.leaseUntil = lease
+	}
+
 	f.lastTimestamp = ts
 	id := ((ts - f.epochMs) << timestampShift) | (f.shardID << shardIDShift) | f.sequence
 	f.generated.Add(1)
 	return strconv.FormatInt(id, 10), nil
 }
 
-// GenerateBatch mints n IDs in a tight loop.
+// GenerateBatch mints n IDs in a tight loop under one lock.
 func (f *Forge) GenerateBatch(n int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		id, err := f.Generate()
+		id, err := f.generateLocked()
 		if err != nil {
 			return nil, err
 		}

@@ -1,46 +1,38 @@
+// Package allocator hands out counter iterations (for int, long and uuid* entities) from
+// in-RAM reservations backed by the state file.
+//
+// Per entity it keeps a window [cursor, reservedEnd): those iterations are durably reserved
+// on disk and owned by this process alone. Requests take from the window without touching
+// disk. When the window runs low a background refill extends it; when a request needs more
+// than the window holds it extends it inline.
+//
+// Exactly one reservation per entity can be in flight. The background refill holds a
+// "reserving" token, and inline reservations and resets wait for it to finish. Every
+// reservation starts at the in-memory reservedEnd, which equals the durable mark. So no two
+// reservations can cover the same iterations, and the same ID can never be issued twice —
+// even under heavy concurrent load.
 package allocator
 
 import (
+	"errors"
 	"fmt"
+	"log"
+	"math"
 	"sync"
 
 	"github.com/telcobright/bucket-next/internal/datatype"
+	"github.com/telcobright/bucket-next/internal/shardmath"
 	"github.com/telcobright/bucket-next/internal/state"
 )
 
-// Allocator owns numeric entity counters with in-RAM segment caching.
-//
-// Disk semantics: state.Record.CurrentIteration is the reserved high-water mark — the
-// smallest iteration not yet allocated to a segment. Each segment reservation advances
-// the disk value by segmentSize in one atomic write. In-RAM, a cursor walks through the
-// reserved range and emits IDs without touching disk. Crash forfeits the unused tail of
-// the in-flight segment, never duplicates IDs.
-type Allocator struct {
-	shardID     int64
-	totalShards int64
-	segmentSize int64
-	watermark   float64
-	store       *state.Store
-
-	mu       sync.Mutex
-	segments map[string]*segment
-	wg       sync.WaitGroup // tracks in-flight refill goroutines
-}
-
-// Close blocks until all background refill goroutines have finished.
-// Call before shutting down to avoid leaking temp state files.
-func (a *Allocator) Close() {
-	a.wg.Wait()
-}
-
-type segment struct {
-	iterStart int64 // inclusive
-	iterEnd   int64 // exclusive
-	cursor    int64 // next iteration to emit; iterStart <= cursor <= iterEnd
-
-	refillInFlight bool
-	next           *segment // pre-fetched next segment, if refill already wrote to disk
-}
+var (
+	// ErrUnknownEntity: the entity is not in the state store.
+	ErrUnknownEntity = errors.New("entity not registered")
+	// ErrExhausted: the entity's type has no values left on this shard.
+	ErrExhausted = errors.New("no values left for this entity's type on this shard")
+	// ErrBackward: a reset would move the counter below IDs that may already be issued.
+	ErrBackward = errors.New("reset would move the counter backward and re-issue IDs")
+)
 
 type Config struct {
 	ShardID     int
@@ -50,305 +42,210 @@ type Config struct {
 	Store       *state.Store
 }
 
+type Allocator struct {
+	layout      shardmath.Layout
+	segmentSize int64
+	threshold   int64 // start a background refill when this many or fewer iterations remain
+	store       *state.Store
+
+	mu       sync.Mutex // guards entities
+	entities map[string]*entity
+	wg       sync.WaitGroup // in-flight background refills
+}
+
+type entity struct {
+	mu   sync.Mutex
+	cond *sync.Cond // broadcast when a background refill finishes
+
+	loaded      bool
+	dataType    datatype.DataType
+	loadMark    int64 // durable mark when this process loaded the entity
+	cursor      int64 // next iteration to hand out
+	reservedEnd int64 // exclusive end of the window owned by this process
+	reserving   bool  // a background refill holds the reservation token
+}
+
 func New(cfg Config) *Allocator {
+	threshold := int64(math.Ceil((1 - cfg.Watermark) * float64(cfg.SegmentSize)))
 	return &Allocator{
-		shardID:     int64(cfg.ShardID),
-		totalShards: int64(cfg.TotalShards),
+		layout:      shardmath.New(cfg.ShardID, cfg.TotalShards),
 		segmentSize: int64(cfg.SegmentSize),
-		watermark:   cfg.Watermark,
+		threshold:   threshold,
 		store:       cfg.Store,
-		segments:    make(map[string]*segment),
+		entities:    make(map[string]*entity),
 	}
 }
 
-// ComputeValue maps an iteration index to its emitted value on this shard.
-// Shard k of N: iter 0 -> k, iter 1 -> k+N, iter 2 -> k+2N, ...
-func (a *Allocator) ComputeValue(iter int64) int64 {
-	return a.shardID + iter*a.totalShards
-}
+func (a *Allocator) Layout() shardmath.Layout { return a.layout }
 
-// IterFromValue is the inverse. Caller must ensure v has the right residue.
-func (a *Allocator) IterFromValue(v int64) int64 {
-	return (v - a.shardID) / a.totalShards
-}
+// Close blocks until all background refills have finished.
+func (a *Allocator) Close() { a.wg.Wait() }
 
-// SnapForward rounds v up to the nearest value (>= v) whose residue mod totalShards
-// matches this shard's residue. If v already matches, returns v unchanged.
-func (a *Allocator) SnapForward(v int64) int64 {
-	rem := ((v % a.totalShards) + a.totalShards) % a.totalShards
-	target := a.shardID % a.totalShards
-	if rem == target {
-		return v
+// Next hands out n consecutive iterations for the entity and returns the first one. The
+// caller turns iteration i into a value with Layout().Value(i). If the entity's type cannot
+// hold all n values, Next fails with ErrExhausted and hands out nothing.
+func (a *Allocator) Next(name string, dt datatype.DataType, n int64) (int64, error) {
+	if n < 1 {
+		return 0, fmt.Errorf("count must be >= 1, got %d", n)
 	}
-	diff := target - rem
-	if diff < 0 {
-		diff += a.totalShards
+	if !dt.IsCounter() {
+		return 0, fmt.Errorf("type %s is not counter-based", dt)
 	}
-	return v + diff
-}
-
-// NextID returns one numeric ID for the entity. Handles segment reservation and refill.
-func (a *Allocator) NextID(entityName string, dt datatype.DataType) (int64, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	seg, err := a.ensureSegmentLocked(entityName, dt)
-	if err != nil {
+	e := a.entityFor(name)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := a.loadLocked(e, name); err != nil {
 		return 0, err
 	}
-	if seg.cursor >= seg.iterEnd {
-		// drained but no next prepared — reserve inline
-		if seg.next == nil {
-			n, err := a.reserveOneSegment(entityName)
-			if err != nil {
-				return 0, err
-			}
-			a.segments[entityName] = n
-			seg = n
-		} else {
-			a.segments[entityName] = seg.next
-			seg = seg.next
+	if e.dataType != dt {
+		return 0, fmt.Errorf("entity %q is registered as %s, not %s", name, e.dataType, dt)
+	}
+	if maxIter := a.layout.MaxIter(dt.MaxValue()); e.cursor+n-1 > maxIter {
+		return 0, ErrExhausted
+	}
+	for e.reservedEnd-e.cursor < n {
+		if e.reserving {
+			e.cond.Wait() // a background refill is extending the window; take turns
+			continue
 		}
+		short := n - (e.reservedEnd - e.cursor)
+		grow := (short + a.segmentSize - 1) / a.segmentSize * a.segmentSize
+		if err := a.store.RaiseMark(name, e.reservedEnd+grow); err != nil {
+			return 0, fmt.Errorf("reserve for %q: %w", name, err)
+		}
+		e.reservedEnd += grow
 	}
+	first := e.cursor
+	e.cursor += n
+	a.maybeRefillLocked(e, name)
+	return first, nil
+}
 
-	iter := seg.cursor
-	seg.cursor++
-
-	consumed := seg.cursor - seg.iterStart
-	if !seg.refillInFlight && seg.next == nil &&
-		float64(consumed)/float64(a.segmentSize) >= a.watermark {
-		a.triggerRefillLocked(entityName)
+// Reset moves the entity's next iteration to target. Moving below anything this or an
+// earlier process may have issued requires force. It returns the next iteration before the
+// reset.
+func (a *Allocator) Reset(name string, target int64, force bool) (int64, error) {
+	if target < 0 {
+		return 0, fmt.Errorf("target iteration must be >= 0, got %d", target)
 	}
-
-	val := a.ComputeValue(iter)
-	if err := CheckOverflow(dt, val); err != nil {
+	e := a.entityFor(name)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := a.loadLocked(e, name); err != nil {
 		return 0, err
 	}
-	return val, nil
+	for e.reserving {
+		e.cond.Wait()
+	}
+	prev := e.cursor
+	if target < e.cursor && !force {
+		return prev, ErrBackward
+	}
+	// Iterations in [cursor, reservedEnd) were reserved but never handed out, so lowering the
+	// durable mark to a forward target is safe.
+	if err := a.store.SetMark(name, target); err != nil {
+		return prev, err
+	}
+	e.cursor, e.reservedEnd = target, target
+	if target < e.loadMark {
+		e.loadMark = target
+	}
+	return prev, nil
 }
 
-// NextBatch reserves segments inline (single durable write) to cover n IDs at once.
-func (a *Allocator) NextBatch(entityName string, dt datatype.DataType, n int) ([]int64, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	seg, err := a.ensureSegmentLocked(entityName, dt)
-	if err != nil {
-		return nil, err
-	}
-
-	needed := int64(n)
-	available := seg.iterEnd - seg.cursor
-	// fold pre-fetched next into available
-	if seg.next != nil {
-		available += seg.next.iterEnd - seg.next.iterStart
-	}
-	if available < needed {
-		extra := needed - available
-		extraSegments := (extra + a.segmentSize - 1) / a.segmentSize
-		rec, ok := a.store.Get(entityName)
-		if !ok {
-			return nil, fmt.Errorf("entity %q vanished during batch reservation", entityName)
-		}
-		newDisk := rec.CurrentIteration + extraSegments*a.segmentSize
-		rec.CurrentIteration = newDisk
-		if err := a.store.Put(*rec); err != nil {
-			return nil, fmt.Errorf("reserve segments for batch: %w", err)
-		}
-		// extend current segment end (or its pre-fetched next) — simplest: collapse next into a single big segment
-		if seg.next != nil {
-			seg.iterEnd = seg.next.iterEnd + extraSegments*a.segmentSize
-			seg.next = nil
-		} else {
-			seg.iterEnd += extraSegments * a.segmentSize
-		}
-	}
-
-	out := make([]int64, 0, n)
-	for i := 0; i < n; i++ {
-		// roll over into pre-fetched next segment if needed (it was folded above, so this is rare)
-		if seg.cursor >= seg.iterEnd && seg.next != nil {
-			a.segments[entityName] = seg.next
-			seg = seg.next
-		}
-		val := a.ComputeValue(seg.cursor)
-		if err := CheckOverflow(dt, val); err != nil {
-			return nil, err
-		}
-		out = append(out, val)
-		seg.cursor++
-	}
-	return out, nil
+// Snapshot is a diagnostic view of one entity's window.
+type Snapshot struct {
+	Loaded         bool  `json:"loaded"`
+	Issued         int64 `json:"issued"`        // handed out by this process since it loaded the entity
+	NextIteration  int64 `json:"nextIteration"` // next iteration this process will hand out
+	ReservedEnd    int64 `json:"reservedEnd"`
+	Remaining      int64 `json:"remaining"` // reserved in RAM, not yet handed out
+	RefillInFlight bool  `json:"refillInFlight"`
+	DiskMark       int64 `json:"diskMark"`
 }
 
-// SegmentSnapshot returns the diagnostic view for /api/segment-state.
-type SegmentSnapshot struct {
-	Size              int64    `json:"size"`
-	Cursor            int64    `json:"cursor"`
-	Remaining         int64    `json:"remaining"`
-	Watermark         float64  `json:"watermark"`
-	RefillInFlight    bool     `json:"refillInFlight"`
-	NextSegmentStart  *string  `json:"nextSegmentStart,omitempty"`
-	DiskHighWaterMark string   `json:"diskHighWaterMark"`
-}
-
-func (a *Allocator) Snapshot(entityName string) (*SegmentSnapshot, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	seg, ok := a.segments[entityName]
+func (a *Allocator) Snapshot(name string) (Snapshot, error) {
+	rec, ok := a.store.Get(name)
 	if !ok {
-		return nil, fmt.Errorf("no in-memory segment for entity %q", entityName)
+		return Snapshot{}, ErrUnknownEntity
 	}
-	rec, _ := a.store.Get(entityName)
-	snap := &SegmentSnapshot{
-		Size:              a.segmentSize,
-		Cursor:            seg.cursor - seg.iterStart,
-		Remaining:         seg.iterEnd - seg.cursor,
-		Watermark:         a.watermark,
-		RefillInFlight:    seg.refillInFlight,
-		DiskHighWaterMark: "0",
-	}
-	if seg.next != nil {
-		s := fmt.Sprintf("%d", a.ComputeValue(seg.next.iterStart))
-		snap.NextSegmentStart = &s
-	}
-	if rec != nil {
-		snap.DiskHighWaterMark = fmt.Sprintf("%d", a.ComputeValue(rec.CurrentIteration))
-	}
-	return snap, nil
-}
-
-// CurrentValue returns the most recently emitted value for an entity (RAM cursor if known,
-// else nil). For uninitialised numeric entities, returns ok=false.
-func (a *Allocator) CurrentValue(entityName string) (int64, bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if seg, ok := a.segments[entityName]; ok && seg.cursor > seg.iterStart {
-		return a.ComputeValue(seg.cursor - 1), true
-	}
-	return 0, false
-}
-
-// NextValue returns the next value the allocator would emit for an entity.
-// Reads in-RAM segment if present; otherwise from the persisted record.
-func (a *Allocator) NextValue(entityName string) (int64, bool) {
-	a.mu.Lock()
-	if seg, ok := a.segments[entityName]; ok && seg.cursor < seg.iterEnd {
-		v := a.ComputeValue(seg.cursor)
-		a.mu.Unlock()
-		return v, true
-	}
-	a.mu.Unlock()
-	rec, ok := a.store.Get(entityName)
-	if !ok {
-		return 0, false
-	}
-	return a.ComputeValue(rec.CurrentIteration), true
-}
-
-// Invalidate drops the in-RAM segment for an entity. Subsequent NextID calls will
-// re-read the State store and reserve a fresh segment from the on-disk high-water mark.
-// Used by /api/reset so an operator's snap-forward to a new value takes effect immediately.
-func (a *Allocator) Invalidate(entityName string) {
-	a.mu.Lock()
-	delete(a.segments, entityName)
-	a.mu.Unlock()
-}
-
-// ----- internal helpers -----
-
-func (a *Allocator) ensureSegmentLocked(entityName string, dt datatype.DataType) (*segment, error) {
-	if seg, ok := a.segments[entityName]; ok {
-		return seg, nil
-	}
-	rec, ok := a.store.Get(entityName)
-	if !ok {
-		return nil, fmt.Errorf("entity %q not registered", entityName)
-	}
-	if rec.DataType != dt {
-		return nil, fmt.Errorf("entity %q is registered as %s, not %s", entityName, rec.DataType, dt)
-	}
-	return a.reserveOneSegment(entityName)
-}
-
-// reserveOneSegment advances disk by one segmentSize and returns a fresh in-RAM segment.
-// Caller must hold a.mu. Also installs the segment in a.segments.
-func (a *Allocator) reserveOneSegment(entityName string) (*segment, error) {
-	rec, ok := a.store.Get(entityName)
-	if !ok {
-		return nil, fmt.Errorf("entity %q vanished during reservation", entityName)
-	}
-	iterStart := rec.CurrentIteration
-	iterEnd := iterStart + a.segmentSize
-	rec.CurrentIteration = iterEnd
-	if err := a.store.Put(*rec); err != nil {
-		return nil, fmt.Errorf("reserve segment for %q: %w", entityName, err)
-	}
-	seg := &segment{
-		iterStart: iterStart,
-		iterEnd:   iterEnd,
-		cursor:    iterStart,
-	}
-	a.segments[entityName] = seg
-	return seg, nil
-}
-
-// triggerRefillLocked starts a background reservation for the next segment.
-// Caller must hold a.mu.
-func (a *Allocator) triggerRefillLocked(entityName string) {
-	seg := a.segments[entityName]
-	seg.refillInFlight = true
-	a.wg.Add(1)
-	go a.runRefill(entityName)
-}
-
-func (a *Allocator) runRefill(entityName string) {
-	defer a.wg.Done()
-	// reserve outside the lock — the disk write is the slow part
-	a.mu.Lock()
-	rec, ok := a.store.Get(entityName)
+	e, ok := a.entities[name]
 	a.mu.Unlock()
 	if !ok {
-		return
+		return Snapshot{NextIteration: rec.CurrentIteration, ReservedEnd: rec.CurrentIteration, DiskMark: rec.CurrentIteration}, nil
 	}
-	iterStart := rec.CurrentIteration
-	iterEnd := iterStart + a.segmentSize
-	rec.CurrentIteration = iterEnd
-	if err := a.store.Put(*rec); err != nil {
-		a.mu.Lock()
-		if s, ok := a.segments[entityName]; ok {
-			s.refillInFlight = false
-		}
-		a.mu.Unlock()
-		return
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.loaded {
+		return Snapshot{NextIteration: rec.CurrentIteration, ReservedEnd: rec.CurrentIteration, DiskMark: rec.CurrentIteration}, nil
 	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	cur, ok := a.segments[entityName]
-	if !ok {
-		return
-	}
-	next := &segment{
-		iterStart: iterStart,
-		iterEnd:   iterEnd,
-		cursor:    iterStart,
-	}
-	if cur.cursor >= cur.iterEnd {
-		a.segments[entityName] = next
-	} else {
-		cur.next = next
-		cur.refillInFlight = false
-	}
+	return Snapshot{
+		Loaded:         true,
+		Issued:         e.cursor - e.loadMark,
+		NextIteration:  e.cursor,
+		ReservedEnd:    e.reservedEnd,
+		Remaining:      e.reservedEnd - e.cursor,
+		RefillInFlight: e.reserving,
+		DiskMark:       rec.CurrentIteration,
+	}, nil
 }
 
-// CheckOverflow returns an error if v exceeds the type's maximum.
-func CheckOverflow(dt datatype.DataType, v int64) error {
-	if dt == datatype.Int && v > datatype.MaxInt {
-		return fmt.Errorf("int overflow: value %d exceeds max %d", v, datatype.MaxInt)
+// ----- internals -----
+
+func (a *Allocator) entityFor(name string) *entity {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.entities[name]
+	if !ok {
+		e = &entity{}
+		e.cond = sync.NewCond(&e.mu)
+		a.entities[name] = e
 	}
-	if dt == datatype.Long && v > datatype.MaxLong {
-		return fmt.Errorf("long overflow: value %d exceeds max %d", v, datatype.MaxLong)
+	return e
+}
+
+func (a *Allocator) loadLocked(e *entity, name string) error {
+	if e.loaded {
+		return nil
 	}
+	rec, ok := a.store.Get(name)
+	if !ok {
+		return ErrUnknownEntity
+	}
+	e.dataType = rec.DataType
+	e.loadMark = rec.CurrentIteration
+	e.cursor = rec.CurrentIteration
+	e.reservedEnd = rec.CurrentIteration
+	e.loaded = true
 	return nil
+}
+
+// maybeRefillLocked starts a background refill when the window runs low. Caller holds e.mu.
+func (a *Allocator) maybeRefillLocked(e *entity, name string) {
+	if e.reserving || e.reservedEnd-e.cursor > a.threshold {
+		return
+	}
+	e.reserving = true
+	from := e.reservedEnd
+	a.wg.Add(1)
+	go a.refill(e, name, from)
+}
+
+// refill extends the window by one segment. It writes the disk without holding e.mu so
+// requests keep being served; nobody else can move reservedEnd while e.reserving is set.
+func (a *Allocator) refill(e *entity, name string, from int64) {
+	defer a.wg.Done()
+	to := from + a.segmentSize
+	err := a.store.RaiseMark(name, to)
+	e.mu.Lock()
+	if err == nil {
+		e.reservedEnd = to
+	}
+	e.reserving = false
+	e.cond.Broadcast()
+	e.mu.Unlock()
+	if err != nil {
+		log.Printf("allocator: background refill for %q failed (requests will retry inline): %v", name, err)
+	}
 }

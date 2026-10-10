@@ -1,21 +1,22 @@
-.PHONY: build run test vet tidy clean
+.PHONY: build service cli run test vet tidy clean
 
 BIN_DIR := bin
-SERVICE := $(BIN_DIR)/bucket-next
-CLI     := $(BIN_DIR)/bucket-next-cli
 
-build: $(SERVICE) $(CLI)
+# Always rebuild (go build is incremental). A file target here would skip the build when
+# bin/ already exists and leave a stale binary for `deploy.sh --skip-build` to ship.
+build: service cli
 
-$(SERVICE):
+service:
 	mkdir -p $(BIN_DIR)
-	go build -o $(SERVICE) ./cmd/bucket-next
+	go build -o $(BIN_DIR)/bucket-next ./cmd/bucket-next
 
-$(CLI):
+cli:
 	mkdir -p $(BIN_DIR)
-	go build -o $(CLI) ./cmd/bucket-next-cli
+	go build -o $(BIN_DIR)/bucket-next-cli ./cmd/bucket-next-cli
 
-run: $(SERVICE)
-	$(SERVICE) -config configs/sample.yaml
+# Local single-shard run; -init creates ./data/state.json on the first start only.
+run: service
+	$(BIN_DIR)/bucket-next -config configs/sample.yaml -init
 
 tidy:
 	go mod tidy
@@ -24,7 +25,7 @@ vet:
 	go vet ./...
 
 test:
-	go test ./...
+	go test -race ./...
 
 clean:
 	rm -rf $(BIN_DIR) data

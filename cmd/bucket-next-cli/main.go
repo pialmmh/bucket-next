@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -8,15 +9,18 @@ import (
 
 	"github.com/telcobright/bucket-next/internal/config"
 	"github.com/telcobright/bucket-next/internal/datatype"
+	"github.com/telcobright/bucket-next/internal/shardmath"
 	"github.com/telcobright/bucket-next/internal/state"
+	"github.com/telcobright/bucket-next/internal/uuidgen"
 )
 
-// CLI for offline maintenance of the State store. Reads the same YAML config as the
-// Service. Operator must stop the Service before running mutations.
+// CLI for offline maintenance of the state store. Reads the same YAML config as the
+// Service and refuses a state file that belongs to another shard. Stop the Service before
+// running any command that changes state.
 
 func main() {
 	var cfgPath string
-	flag.StringVar(&cfgPath, "config", "", "path to YAML config file (required for shard-aware commands)")
+	flag.StringVar(&cfgPath, "config", "", "path to YAML config file (required)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -25,12 +29,10 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, rest := args[0], args[1:]
-
 	if cmd == "help" {
 		usage()
 		return
 	}
-
 	if cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "error: -config <path> is required")
 		os.Exit(2)
@@ -39,20 +41,34 @@ func main() {
 	if err != nil {
 		die("config: %v", err)
 	}
-	st, err := state.Open(cfg.StatePath)
+	identity := identityOf(cfg)
+	layout := shardmath.New(cfg.ShardID, cfg.TotalShards)
+
+	if cmd == "init-state" {
+		if _, err := state.Create(cfg.StatePath, identity); err != nil {
+			die("%v", err)
+		}
+		fmt.Printf("OK created %s for shard %d/%d\n", cfg.StatePath, cfg.ShardID, cfg.TotalShards)
+		return
+	}
+
+	st, err := state.Open(cfg.StatePath, identity)
+	if errors.Is(err, state.ErrNotFound) {
+		die("%v\nFor a brand-new shard run: bucket-next-cli -config %s init-state", err, cfgPath)
+	}
 	if err != nil {
 		die("state: %v", err)
 	}
 
 	switch cmd {
 	case "list":
-		cmdList(cfg, st)
+		cmdList(cfg, layout, st)
 	case "status":
-		cmdStatus(cfg, st, rest)
+		cmdStatus(cfg, layout, st, rest)
 	case "init":
-		cmdInit(cfg, st, rest)
+		cmdInit(layout, st, rest)
 	case "reset":
-		cmdReset(cfg, st, rest)
+		cmdReset(cfg, layout, st, rest)
 	case "delete":
 		cmdDelete(st, rest)
 	case "clear":
@@ -66,50 +82,43 @@ func main() {
 	}
 }
 
-// ---------- shard math (duplicates allocator helpers; the CLI does not run an Allocator) ----------
-
-func computeValue(cfg *config.Config, iter int64) int64 {
-	return int64(cfg.ShardID) + iter*int64(cfg.TotalShards)
-}
-
-func iterFromValue(cfg *config.Config, v int64) int64 {
-	return (v - int64(cfg.ShardID)) / int64(cfg.TotalShards)
-}
-
-func snapForward(cfg *config.Config, v int64) int64 {
-	N := int64(cfg.TotalShards)
-	rem := ((v % N) + N) % N
-	target := int64(cfg.ShardID) % N
-	if rem == target {
-		return v
+func identityOf(cfg *config.Config) state.Identity {
+	key, err := cfg.UUIDKeyBytes()
+	if err != nil {
+		die("config: %v", err)
 	}
-	diff := target - rem
-	if diff < 0 {
-		diff += N
+	if key == nil {
+		key = uuidgen.DefaultKey()
 	}
-	return v + diff
+	return state.Identity{
+		ShardID:            cfg.ShardID,
+		TotalShards:        cfg.TotalShards,
+		UUIDKeyFingerprint: uuidgen.Fingerprint(key),
+		SnowflakeEpochMs:   cfg.SnowflakeEpochMs,
+	}
 }
 
 // ---------- commands ----------
 
-func cmdList(cfg *config.Config, st *state.Store) {
+// The service may have issued any value below the stored mark (it reserves ahead), so the
+// CLI treats the mark as "next value" and never moves below it without --force.
+
+func cmdList(cfg *config.Config, layout shardmath.Layout, st *state.Store) {
 	records := st.All()
 	if len(records) == 0 {
 		fmt.Println("No entities registered.")
 		return
 	}
-	fmt.Printf("Registered Entities (shard %d/%d):\n", cfg.ShardID, cfg.TotalShards)
-	fmt.Println("================================")
+	fmt.Printf("Registered entities (shard %d/%d):\n", cfg.ShardID, cfg.TotalShards)
 	for _, r := range records {
-		fmt.Printf("\nEntity: %s\n  Type:        %s\n  Iteration:   %d\n",
-			r.EntityName, r.DataType, r.CurrentIteration)
+		fmt.Printf("\nEntity: %s\n  Type:        %s\n  Mark:        %d\n", r.EntityName, r.DataType, r.CurrentIteration)
 		if r.DataType.IsNumeric() {
-			fmt.Printf("  Next value:  %d\n", computeValue(cfg, r.CurrentIteration))
+			fmt.Printf("  Next value:  %d\n", layout.Value(r.CurrentIteration))
 		}
 	}
 }
 
-func cmdStatus(cfg *config.Config, st *state.Store, args []string) {
+func cmdStatus(cfg *config.Config, layout shardmath.Layout, st *state.Store, args []string) {
 	if len(args) != 1 {
 		die("usage: status <entity>")
 	}
@@ -117,16 +126,16 @@ func cmdStatus(cfg *config.Config, st *state.Store, args []string) {
 	if !ok {
 		die("entity %q not found", args[0])
 	}
-	fmt.Printf("Entity:      %s\nType:        %s\nShard:       %d/%d\nIteration:   %d\n",
+	fmt.Printf("Entity:      %s\nType:        %s\nShard:       %d/%d\nMark:        %d\n",
 		r.EntityName, r.DataType, cfg.ShardID, cfg.TotalShards, r.CurrentIteration)
 	if r.DataType.IsNumeric() {
 		fmt.Printf("Next value:  %d\nPattern:     %d, %d, %d, ...\n",
-			computeValue(cfg, r.CurrentIteration),
+			layout.Value(r.CurrentIteration),
 			cfg.ShardID, cfg.ShardID+cfg.TotalShards, cfg.ShardID+2*cfg.TotalShards)
 	}
 }
 
-func cmdInit(cfg *config.Config, st *state.Store, args []string) {
+func cmdInit(layout shardmath.Layout, st *state.Store, args []string) {
 	if len(args) < 2 || len(args) > 3 {
 		die("usage: init <entity> <type> [start-value]")
 	}
@@ -135,44 +144,30 @@ func cmdInit(cfg *config.Config, st *state.Store, args []string) {
 	if err != nil {
 		die("%v", err)
 	}
-	if _, ok := st.Get(name); ok {
-		die("entity %q already exists", name)
-	}
-
 	var iter int64
 	if len(args) == 3 {
 		if !dt.IsNumeric() {
-			die("start-value only valid for numeric types")
+			die("start-value is only supported for int and long")
 		}
-		requested, err := strconv.ParseInt(args[2], 10, 64)
-		if err != nil {
-			die("invalid start-value: %v", err)
-		}
-		snapped := snapForward(cfg, requested)
-		if snapped != requested {
-			fmt.Printf("snapped start-value %d -> %d (shard %d residue)\n",
-				requested, snapped, cfg.ShardID)
-		}
-		iter = iterFromValue(cfg, snapped)
+		snapped := snapValue(layout, dt, args[2])
+		iter = layout.Iter(snapped)
 	}
-	if err := st.Put(state.Record{
-		EntityName:       name,
-		DataType:         dt,
-		CurrentIteration: iter,
-		ShardID:          cfg.ShardID,
-	}); err != nil {
+	if _, created, err := st.Register(name, dt, iter); err != nil {
 		die("write state: %v", err)
+	} else if !created {
+		die("entity %q already exists", name)
 	}
-	fmt.Printf("OK initialised %q as %s", name, dt)
+	fmt.Printf("OK initialised %q as %s on shard %d", name, dt, layout.ShardID)
 	if dt.IsNumeric() {
-		fmt.Printf("; first value will be %d", computeValue(cfg, iter))
+		fmt.Printf("; first value will be %d", layout.Value(iter))
 	}
 	fmt.Println()
 }
 
-func cmdReset(cfg *config.Config, st *state.Store, args []string) {
+func cmdReset(cfg *config.Config, layout shardmath.Layout, st *state.Store, args []string) {
+	force := hasFlag(&args, "--force")
 	if len(args) != 2 {
-		die("usage: reset <entity> <value>")
+		die("usage: reset <entity> <value> [--force]")
 	}
 	name := args[0]
 	r, ok := st.Get(name)
@@ -182,29 +177,31 @@ func cmdReset(cfg *config.Config, st *state.Store, args []string) {
 	if !r.DataType.IsNumeric() {
 		die("reset only valid for int and long; %q is %s", name, r.DataType)
 	}
-	requested, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil {
-		die("invalid value: %v", err)
+	snapped := snapValue(layout, r.DataType, args[1])
+	newIter := layout.Iter(snapped)
+	if newIter < r.CurrentIteration && !force {
+		die("refused: next value is %d and the service may have issued anything below it; "+
+			"moving to %d could re-issue IDs. Add --force to do it anyway.",
+			layout.Value(r.CurrentIteration), snapped)
 	}
-	snapped := snapForward(cfg, requested)
-	if snapped != requested {
-		fmt.Printf("snapped %d -> %d (shard %d residue)\n", requested, snapped, cfg.ShardID)
-	}
-	prev := r.CurrentIteration
-	r.CurrentIteration = iterFromValue(cfg, snapped)
-	if err := st.Put(*r); err != nil {
+	if err := st.SetMark(name, newIter); err != nil {
 		die("write state: %v", err)
 	}
-	fmt.Printf("OK %q reset: iteration %d -> %d; next value will be %d\n",
-		name, prev, r.CurrentIteration, computeValue(cfg, r.CurrentIteration))
+	fmt.Printf("OK %q on shard %d/%d: next value %d -> %d\n",
+		name, cfg.ShardID, cfg.TotalShards, layout.Value(r.CurrentIteration), snapped)
 }
 
 func cmdDelete(st *state.Store, args []string) {
+	force := hasFlag(&args, "--force")
 	if len(args) != 1 {
-		die("usage: delete <entity>")
+		die("usage: delete <entity> --force")
 	}
 	if _, ok := st.Get(args[0]); !ok {
 		die("entity %q not found", args[0])
+	}
+	if !force {
+		die("refused: if %q is used again it restarts from its first value and re-issues IDs. "+
+			"Add --force to delete anyway.", args[0])
 	}
 	if err := st.Delete(args[0]); err != nil {
 		die("delete: %v", err)
@@ -213,8 +210,8 @@ func cmdDelete(st *state.Store, args []string) {
 }
 
 func cmdClear(st *state.Store, args []string) {
-	if len(args) != 1 || args[0] != "--force" {
-		die("usage: clear --force   (refuses without --force)")
+	if !hasFlag(&args, "--force") || len(args) != 0 {
+		die("usage: clear --force   (every entity restarts from its first value; IDs will be re-issued)")
 	}
 	n := len(st.All())
 	if err := st.Clear(); err != nil {
@@ -225,43 +222,82 @@ func cmdClear(st *state.Store, args []string) {
 
 func cmdInfo(cfg *config.Config, st *state.Store) {
 	records := st.All()
-	fmt.Printf("Shard:      %d/%d\n", cfg.ShardID, cfg.TotalShards)
-	fmt.Printf("State path: %s\n", cfg.StatePath)
-	fmt.Printf("Entities:   %d\n", len(records))
+	id := st.Identity()
+	fmt.Printf("Shard:            %d/%d\n", id.ShardID, id.TotalShards)
+	fmt.Printf("State path:       %s\n", cfg.StatePath)
+	fmt.Printf("uuid key:         fingerprint %s\n", id.UUIDKeyFingerprint)
+	fmt.Printf("Snowflake epoch:  %d\n", id.SnowflakeEpochMs)
+	fmt.Printf("Snowflake mark:   %d\n", st.SnowflakeMark())
+	fmt.Printf("Entities:         %d\n", len(records))
 	counts := map[datatype.DataType]int{}
 	for _, r := range records {
 		counts[r.DataType]++
 	}
-	if len(counts) > 0 {
-		fmt.Println("By type:")
-		for _, dt := range datatype.All {
-			if counts[dt] > 0 {
-				fmt.Printf("  %-10s %d\n", dt, counts[dt])
-			}
+	for _, dt := range datatype.All {
+		if counts[dt] > 0 {
+			fmt.Printf("  %-10s %d\n", dt, counts[dt])
 		}
 	}
 	if fi, err := os.Stat(cfg.StatePath); err == nil {
-		fmt.Printf("File size:  %d bytes\n", fi.Size())
-		fmt.Printf("Modified:   %s\n", fi.ModTime().Format("2006-01-02 15:04:05"))
+		fmt.Printf("File size:        %d bytes\n", fi.Size())
+		fmt.Printf("Modified:         %s\n", fi.ModTime().Format("2006-01-02 15:04:05"))
 	}
 }
 
 // ---------- helpers ----------
 
+// snapValue parses a user value for an int/long entity, checks its range and snaps it to
+// this shard.
+func snapValue(layout shardmath.Layout, dt datatype.DataType, s string) int64 {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		die("invalid value %q: %v", s, err)
+	}
+	if v < 1 || v > dt.MaxValue() {
+		die("value must be between 1 and %d for %s", dt.MaxValue(), dt)
+	}
+	snapped := layout.SnapForward(v)
+	if snapped < v || snapped > dt.MaxValue() {
+		die("value %d has no slot for shard %d at or below %d", v, layout.ShardID, dt.MaxValue())
+	}
+	if snapped != v {
+		fmt.Printf("snapped %d -> %d (shard %d residue)\n", v, snapped, layout.ShardID)
+	}
+	return snapped
+}
+
+// hasFlag removes flag from args and reports whether it was there.
+func hasFlag(args *[]string, flag string) bool {
+	found := false
+	out := (*args)[:0]
+	for _, a := range *args {
+		if a == flag {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	*args = out
+	return found
+}
+
 func usage() {
-	fmt.Println("bucket-next-cli — offline maintenance for the State store")
+	fmt.Println("bucket-next-cli — offline maintenance for the state store")
 	fmt.Println()
 	fmt.Println("Usage: bucket-next-cli -config <path> <command> [args]")
 	fmt.Println()
 	fmt.Println("Commands:")
+	fmt.Println("  init-state                        create the state file for a brand-new shard")
 	fmt.Println("  list                              list all entities")
 	fmt.Println("  status <entity>                   show one entity")
-	fmt.Println("  init <entity> <type> [start]      register an entity (snaps start to shard)")
-	fmt.Println("  reset <entity> <value>            move numeric counter (snaps to shard)")
-	fmt.Println("  delete <entity>                   remove one entity")
+	fmt.Println("  init <entity> <type> [start]      register an entity (start snaps to the shard)")
+	fmt.Println("  reset <entity> <value> [--force]  move an int/long counter forward (--force to go back)")
+	fmt.Println("  delete <entity> --force           remove one entity (its IDs restart if reused)")
 	fmt.Println("  clear --force                     remove all entities")
 	fmt.Println("  info                              system info")
 	fmt.Println("  help                              show this help")
+	fmt.Println()
+	fmt.Println("Stop the service before init, reset, delete or clear.")
 }
 
 func die(format string, args ...any) {

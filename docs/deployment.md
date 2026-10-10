@@ -1,11 +1,11 @@
 # Deployment guide
 
-How to deploy bucket-next to one or many servers. The deploy system is routesphere-style:
-**one tenant config file per tenant, one section per profile (environment), one command pushes
-every shard in that profile over SSH.**
+How to deploy bucket-next to one or many servers. Routesphere-style: **one tenant config file
+per tenant, one section per profile (environment), one command pushes every shard of that
+profile over SSH.**
 
-Because shards never coordinate at runtime (interleaved counters + shard-in-bits Snowflake),
-the deployer only needs SSH access to each shard's node — nothing else.
+Shards never talk to each other at runtime (shard-interleaved counters, shard id in the
+Snowflake bits), so the deployer only needs SSH access to each shard's host.
 
 ---
 
@@ -15,8 +15,8 @@ the deployer only needs SSH access to each shard's node — nothing else.
 |---|---|
 | **Tenant** | One logical cluster, e.g. `link3`. Has its own `deploy/tenants/<tenant>.conf`. |
 | **Profile** | An environment within the tenant: `dev`, `staging`, `prod`. One `[section]` per profile, listing every shard. |
-| **Shard** | One bucket-next process. Numbered `1..total_shards`, fixed for life. |
-| **Inventory** | SSH connection details under `deploy/ssh-inventory/<inventory_tenant>/`. One file per host. |
+| **Shard** | One bucket-next process: systemd unit `bucket-next@<shard_id>`, numbered `1..total_shards`, fixed for life. |
+| **Inventory** | SSH details under `deploy/ssh-inventory/<inventory_tenant>/`. One file per host. |
 
 ```
 deploy/
@@ -26,65 +26,77 @@ deploy/
 ├── ssh-inventory/
 │   └── <inventory_tenant>/
 │       ├── hosts/<server-name>     # host=, port=, user=, key=, ...
-│       └── keys/<key>.pem          # private keys (gitignored, mode 0600)
+│       └── keys/                   # SSH keys + uuid key files (gitignored, mode 0600)
 └── dependencies/
-    ├── bucket-next.service.tmpl    # systemd unit template
-    └── remote-setup.sh             # runs on the target server
+    ├── bucket-next@.service        # systemd template unit, one instance per shard
+    └── remote-setup.sh             # runs on the target host
 ```
+
+On each target host:
+
+| Path | What |
+|---|---|
+| `/opt/bucket-next/bucket-next`, `bucket-next-cli` | binaries (shared by all shards on the host) |
+| `/etc/bucket-next/shard-<id>.yaml` | that shard's config (0640, may hold the uuid key) |
+| `/var/lib/bucket-next/shard-<id>/state.json` | that shard's state file |
+| `bucket-next@<id>.service` | that shard's systemd unit |
 
 ---
 
 ## Prerequisites
 
-**On the machine you run `deploy.sh` from:**
-- Go 1.21+ (the script cross-compiles a static Linux binary).
-- `ssh` and `scp`.
+**On the machine you run `deploy.sh` from:** Go 1.21+, `ssh`, `scp`.
 
-**On each target server:**
+**On each target host:**
 - SSH reachable with a key.
-- The SSH user can run `sudo` **without a password prompt** (the script creates a service
-  user, installs a systemd unit, and writes to `/opt` and `/var/lib`). Configure passwordless
-  sudo for the deploy user beforehand — the script never embeds a password.
-- `systemd` (the service runs as a unit).
-- `curl` (used for the post-deploy health probe).
-- Outbound network not required — the static binary is copied in; nothing is downloaded.
+- The SSH user can run `sudo` **without a password** (the setup creates a service user,
+  installs a systemd unit, writes to `/opt`, `/etc` and `/var/lib`). Configure this beforehand;
+  the scripts never contain a password.
+- `systemd` and `curl`.
+- No internet access is needed: the static binary is copied in.
 
 ---
 
 ## One-time setup for a new tenant
 
-### 1. Create the tenant config
-
-`deploy/tenants/<tenant>.conf`, one section per profile:
+### 1. Tenant config — `deploy/tenants/<tenant>.conf`
 
 ```ini
 [dev]
 description           = link3 dev cluster, 3 shards
 inventory_tenant      = link3
 
-# Service tuning — applied identically to every shard in this profile.
+# Applied to every shard of this profile.
+listen_address        = private_ip
 listen_port           = 7001
-state_path            = /var/lib/bucket-next/state.json
+state_path            = /var/lib/bucket-next/shard-{shard_id}/state.json
 segment_size          = 1000
-segment_refill_watermark = 0.9
-clock_drift_tolerance_ms = 0
+segment_refill_watermark = 0.5
 snowflake_epoch_ms    = 1704067200000
+uuid_key_file         = ssh-inventory/link3/keys/uuid-dev.key
 
-# Cluster sizing — total_shards MUST equal the count of shardN.server keys below.
 total_shards          = 3
-
-# Per-shard server assignment. The value is a host-file name under
-# ssh-inventory/<inventory_tenant>/hosts/
 shard1.server         = link3-dev-1
 shard2.server         = link3-dev-2
 shard3.server         = link3-dev-3
 ```
 
-Add `[staging]`, `[prod]`, etc. as needed. Each profile can have a different shard count.
+| Key | Required | Notes |
+|---|---|---|
+| `inventory_tenant` | yes | sub-dir of `ssh-inventory/` holding the host files |
+| `total_shards` | yes | the cluster size the id space is partitioned for, fixed once; the `shardN.server` keys are numbered `1..K` without gaps with `K <= total_shards` (a declared, not yet deployed shard is added later as a line of its own) |
+| `shardN.server` | yes | host-file name for shard N |
+| `listen_address` | no | empty = all interfaces; an IP = that IP on every shard; `private_ip` = each shard binds the `private_ip` from its own host file (recommended for servers) |
+| `state_path` | no | `{shard_id}` is replaced per shard. Default `/var/lib/bucket-next/shard-{shard_id}/state.json` |
+| `uuid_key_file` | no | file with 32/48/64 hex chars, relative to `deploy/` or absolute. Same file for every shard. Unset = built-in key (unique but predictable) |
+| `listen_port`, `segment_size`, `segment_refill_watermark`, `clock_drift_tolerance_ms`, `snowflake_epoch_ms` | no | copied into each shard's config |
 
-### 2. Create the SSH inventory
+Every `shardN.server` of a profile must have a host file, even when you deploy with
+`--shard`, because the script checks all shards for clashes first.
 
-One host file per server at `deploy/ssh-inventory/<inventory_tenant>/hosts/<server-name>`:
+### 2. SSH inventory — one host file per server
+
+`deploy/ssh-inventory/<inventory_tenant>/hosts/<server-name>`:
 
 ```ini
 host=10.10.199.11
@@ -92,157 +104,155 @@ port=22
 user=ubuntu
 key=link3-deploy.pem
 private_ip=10.10.199.11
-# Optional — bind a non-default port on this host (use when two shards share one machine).
-#listen_port_override=7011
+# Optional — this shard's port when two shards share the host
+#listen_port_override=7002
 ```
 
-### 3. Drop the private key
-
-Put the key referenced by `key=` into
-`deploy/ssh-inventory/<inventory_tenant>/keys/<key>` with mode `0600`. This directory is
-gitignored, so keys never get committed.
+### 3. Keys (never committed)
 
 ```bash
 cp ~/Downloads/link3-deploy.pem deploy/ssh-inventory/link3/keys/
 chmod 600 deploy/ssh-inventory/link3/keys/link3-deploy.pem
+
+# uuid key: once per profile, before the first uuid ID; never change it afterwards
+openssl rand -hex 16 > deploy/ssh-inventory/link3/keys/uuid-dev.key
+chmod 600 deploy/ssh-inventory/link3/keys/uuid-dev.key
 ```
+
+`*.pem`, `*.key` and `id_*` under `ssh-inventory/**/keys/` are gitignored. **Back up the uuid
+key file**: losing it means uuid entities cannot continue without risking repeats.
 
 ---
 
 ## Deploying
 
-### Dry run first (always)
+### Always dry-run first
 
-Prints the plan and the exact `config.yaml` each shard would receive, **without contacting any
-host**:
+Prints the plan and the exact config each shard would get (uuid key hidden), without
+contacting any host:
 
 ```bash
 ./deploy/deploy.sh link3 dev --dry-run
 ```
 
-Verify each shard maps to the right server and gets the right `shard_id`.
+Check each shard's server, port and state path.
 
-### Deploy the whole profile
+### First deploy of a profile — `--init-state`
+
+New shards have no state file, and the service refuses to start without one. Create them on
+the first deploy:
 
 ```bash
-./deploy/deploy.sh link3 dev
+./deploy/deploy.sh link3 dev --init-state
 ```
 
-This builds once, then for each shard in order: renders config, renders the systemd unit,
-copies binary + config + unit + setup script, runs the setup, and health-checks the node.
+`--init-state` only creates **missing** files; it never touches an existing one. Do **not** use
+it to "fix" a shard whose state file was lost — restore that file from backup instead.
 
-### Deploy a single shard
-
-Useful for fixing one node without touching the rest:
+### Normal deploys
 
 ```bash
-./deploy/deploy.sh link3 prod --shard 4
-```
-
-### Redeploy without rebuilding
-
-```bash
-./deploy/deploy.sh link3 staging --skip-build
-```
-
-### List what's available
-
-```bash
-./deploy/deploy.sh --list
+./deploy/deploy.sh link3 dev                    # every shard, in order
+./deploy/deploy.sh link3 prod --shard 4         # one shard
+./deploy/deploy.sh link3 staging --skip-build   # reuse bin/ (run `make build` first)
+./deploy/deploy.sh --list                       # tenants and profiles
 ```
 
 ---
 
-## What happens on each shard
+## What happens
 
-The script runs this pipeline per shard:
+Before contacting any host, the script checks:
+- every shard has a host file, and shards are numbered `1..total_shards`;
+- no two shards use the **same host + port**, or the **same host + state file**;
+- the uuid key file exists and holds valid hex.
 
-1. **Build once** (first shard only): `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build`
-   produces `bin/bucket-next` and `bin/bucket-next-cli`. The target never needs Go.
-2. **Render `config.yaml`** with this shard's `shard_id`, the profile's `total_shards`, and the
-   tuning knobs. Port is `listen_port` unless the host file sets `listen_port_override`.
-3. **Render the systemd unit** from `dependencies/bucket-next.service.tmpl`.
-4. **Copy** binary, CLI, `config.yaml`, unit, and `remote-setup.sh` over a multiplexed SSH
-   connection.
-5. **Run `remote-setup.sh`** on the target, which:
-   - creates the `bucket-next` system user (if missing),
-   - installs binaries to `/opt/bucket-next/`,
-   - installs config to `/opt/bucket-next/config.yaml`,
-   - ensures `/var/lib/bucket-next/` exists and is owned by the service user,
-   - installs and enables the systemd unit, then `systemctl restart bucket-next`.
-6. **Health probe**: `curl http://127.0.0.1:<port>/health` on the target; warns if the
-   expected payload is missing.
+Then, per shard:
+1. **Build once**: `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build` → `bin/`.
+2. **Render** `config.yaml` with this shard's `shard_id`, port and state path, plus the
+   profile's settings and uuid key.
+3. **Copy** binaries, config, `bucket-next@.service` and `remote-setup.sh` over one multiplexed
+   SSH connection.
+4. **`remote-setup.sh`** on the host:
+   - creates the `bucket-next` user if missing;
+   - installs binaries to `/opt/bucket-next/` and the config to `/etc/bucket-next/shard-<id>.yaml`;
+   - creates the state directory;
+   - moves a legacy `/var/lib/bucket-next/state.json` (from the old single-unit layout) to this
+     shard's path if this shard has no file yet — the service then upgrades it and refuses it
+     if it belongs to another shard;
+   - with `--init-state`, creates a missing state file; without it, a missing file **fails**
+     the deploy;
+   - retires the legacy `bucket-next.service` unit if present;
+   - installs the template unit and restarts `bucket-next@<id>`.
+5. **Verify**: reads `/shard-info` on the host — at the address the shard binds — and checks it
+   reports this `shardId` and `totalShards`.
 
-A summary at the end reports which shards succeeded.
+The summary lists failed shards. Afterwards, compare `uuidKeyFingerprint` and
+`snowflakeEpochMs` in the printed `/shard-info` lines — they must match on every shard.
 
 ---
 
-## Verifying a live deployment
+## Verifying a live cluster
 
 ```bash
-# From your machine, against a node's reachable address:
-curl http://<node-host>:7001/health
-curl http://<node-host>:7001/shard-info     # confirm shard_id is what you expect
-
-# On the node itself:
-sudo systemctl status bucket-next
-sudo journalctl -u bucket-next -f
+for h in 10.10.199.11 10.10.199.12 10.10.199.13; do curl -s http://$h:7001/shard-info; echo; done
 ```
 
-Confirm each node reports a **distinct** `shardId` and the **same** `totalShards`.
+Expect distinct `shardId`s and identical `totalShards`, `uuidKeyFingerprint`,
+`snowflakeEpochMs`.
+
+On a host:
+
+```bash
+systemctl list-units 'bucket-next@*'
+sudo systemctl status bucket-next@2
+sudo journalctl -u bucket-next@2 -f
+```
 
 ---
 
 ## Two shards on one host
 
-Point two `shardN.server` keys at two inventory files that reference the same machine with
-different `listen_port_override` values:
+Point two `shardN.server` keys at two host files for the same machine, with different
+`listen_port_override` values. Each shard gets its own unit (`bucket-next@1`, `bucket-next@2`),
+config and state file (`{shard_id}` in `state_path`):
 
 ```ini
 # tenants/tcteltd.conf
 [dev]
 inventory_tenant = tcteltd
 total_shards     = 2
+state_path       = /var/lib/bucket-next/shard-{shard_id}/state.json
 shard1.server    = tcteltd-dev-1a
 shard2.server    = tcteltd-dev-1b
 ```
 
 ```ini
-# ssh-inventory/tcteltd/hosts/tcteltd-dev-1a
-host=10.10.198.5
-...
-listen_port_override=7001
-
-# ssh-inventory/tcteltd/hosts/tcteltd-dev-1b
-host=10.10.198.5
-...
-listen_port_override=7002
+# ssh-inventory/tcteltd/hosts/tcteltd-dev-1a      # ssh-inventory/tcteltd/hosts/tcteltd-dev-1b
+host=10.10.198.5                                  host=10.10.198.5
+listen_port_override=7001                         listen_port_override=7002
 ```
 
-Each shard binds its own port, keeps its own state file path (set `state_path` per host if they
-must differ), and runs as the same systemd unit name — so for production you would typically
-template the unit name too. For dev, two ports on one box is fine.
-
-> Note: the bundled `bucket-next.service` uses a fixed unit name. To run two instances on one
-> host as systemd services, give each a distinct unit name and `state_path`. For a quick dev
-> setup, running the second instance manually (`./bin/bucket-next -config shard2.yaml`) is
-> simpler.
+If two shards would share a port or a state file, `deploy.sh` stops before touching anything.
 
 ---
 
-## Rollback
+## Backups and rollback
 
-The deploy installs the new binary over the old one and restarts. To roll back, redeploy the
-previous git tag:
+- **Back up** `/var/lib/bucket-next/shard-*/state.json` on every host, and the uuid key files.
+  A shard whose state file is lost cannot safely restart (the service refuses); restore the
+  file from backup. An older backup is fine **only** if you then move each counter forward
+  past anything issued since (the HTTP `reset` endpoint or CLI `reset`).
+- **Rollback** a binary by redeploying an older git tag:
 
-```bash
-git checkout <previous-tag>
-./deploy/deploy.sh link3 prod --shard <n>
-git checkout main
-```
+  ```bash
+  git checkout <previous-tag>
+  ./deploy/deploy.sh link3 prod --shard <n>
+  git checkout main
+  ```
 
-State on disk (`/var/lib/bucket-next/state.json`) is **not** touched by a binary swap, so
-counters survive a rollback.
+  State files are not touched by a binary swap. Note: a pre-v2 binary cannot read a v2 state
+  file, so roll back no further than this release once it has run.
 
 ---
 
@@ -252,18 +262,24 @@ counters survive a rollback.
 |---|---|
 | `ERROR: tenant config not found` | Wrong tenant name; run `./deploy/deploy.sh --list`. |
 | `ERROR: profile '<x>' not found` | Section missing in the tenant `.conf`. |
-| `ERROR: total_shards=N but found M shardN.server entries` | Count mismatch — fix the `.conf`. |
-| `ERROR: SSH key not found` | Key not placed in `ssh-inventory/<tenant>/keys/`, or `key=` name wrong. |
-| `Permission denied (publickey)` | Wrong key, wrong `user=`, or key not authorized on the host. |
-| `sudo: a password is required` | The SSH user lacks passwordless sudo on the target. |
-| Health probe warns | Service didn't start — `sudo journalctl -u bucket-next -n 50` on the node. |
+| `ERROR: total_shards=N but found M shardN.server entries` | Count mismatch in the `.conf`. |
+| `ERROR: shard N: host file not found` | Every shard of the profile needs a host file. |
+| `ERROR: shards 1 and 2 both listen on …` | Same host + port: set `listen_port_override`. |
+| `ERROR: shards 1 and 2 share state file …` | Put `{shard_id}` in `state_path`. |
+| `ERROR: SSH key not found` | Key missing in `ssh-inventory/<tenant>/keys/`, or `key=` wrong. |
+| `Permission denied (publickey)` | Wrong key or `user=`, or key not authorized on the host. |
+| `sudo: a password is required` | The SSH user lacks passwordless sudo. |
+| `[remote] ERROR: state file … does not exist` | First deploy → add `--init-state`. Lost file → restore from backup. |
+| unit fails; journal says `does not belong to this config` | Wrong state file for this shard, or `total_shards` / uuid key / epoch changed. Fix the config. |
+| unit fails; journal says `clock is … behind the last persisted snowflake mark` | The host clock jumped back. Fix NTP. |
 
 ---
 
 ## Security notes
 
-- Private keys live only under `ssh-inventory/**/keys/` and are gitignored. Never commit them.
-- The service has **no authentication**. Bind it to a private subnet / management network, and
-  restrict the port with a firewall or security group. Do not expose 7001 publicly.
-- The deploy script embeds **no passwords**. It relies on key-based SSH and passwordless sudo
-  configured out-of-band on the target.
+- Keys live only under `ssh-inventory/**/keys/` (gitignored). Never commit them.
+- Rendered configs on hosts are `0640 root:bucket-next` because they may hold the uuid key.
+- The service has **no authentication**. Set `listen_address = private_ip` (or an explicit IP) so
+  it never binds a public interface, and firewall the port. The plan line `Bind:` warns when a
+  profile binds every interface.
+- The scripts contain **no passwords**; they need key-based SSH and passwordless sudo.

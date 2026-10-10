@@ -1,8 +1,12 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,11 +18,21 @@ type Config struct {
 	ListenPort  int    `yaml:"listen_port"`
 	StatePath   string `yaml:"state_path"`
 
+	// ListenAddress is the IP the HTTP server binds. Empty (the default) means every
+	// interface. The API has no authentication, so a dev box should say 127.0.0.1 and a
+	// server its private IP.
+	ListenAddress string `yaml:"listen_address"`
+
 	SegmentSize            int     `yaml:"segment_size"`
 	SegmentRefillWatermark float64 `yaml:"segment_refill_watermark"`
 	ClockDriftToleranceMs  int64   `yaml:"clock_drift_tolerance_ms"`
 
 	SnowflakeEpochMs int64 `yaml:"snowflake_epoch_ms"`
+
+	// UUIDKey is the hex AES key (32, 48 or 64 hex chars) that scrambles uuid* IDs. It must
+	// be identical on every shard and must never change once IDs are issued. Empty means a
+	// built-in key: IDs stay unique but are predictable to anyone with the source.
+	UUIDKey string `yaml:"uuid_key"`
 }
 
 // Load reads a YAML config file, applies defaults, and validates.
@@ -46,7 +60,7 @@ func (c *Config) applyDefaults() {
 		c.SegmentSize = 1000
 	}
 	if c.SegmentRefillWatermark == 0 {
-		c.SegmentRefillWatermark = 0.9
+		c.SegmentRefillWatermark = 0.5
 	}
 	if c.SnowflakeEpochMs == 0 {
 		c.SnowflakeEpochMs = 1704067200000
@@ -66,6 +80,10 @@ func (c *Config) validate() error {
 	if c.ListenPort < 1 || c.ListenPort > 65535 {
 		return fmt.Errorf("listen_port must be in [1, 65535], got %d", c.ListenPort)
 	}
+	if c.ListenAddress != "" && net.ParseIP(c.ListenAddress) == nil {
+		return fmt.Errorf("listen_address must be an IP address such as 127.0.0.1 or the host's private IP "+
+			"(empty = all interfaces), got %q", c.ListenAddress)
+	}
 	if c.StatePath == "" {
 		return fmt.Errorf("state_path is required")
 	}
@@ -75,5 +93,31 @@ func (c *Config) validate() error {
 	if c.SegmentRefillWatermark <= 0 || c.SegmentRefillWatermark >= 1 {
 		return fmt.Errorf("segment_refill_watermark must be in (0, 1), got %f", c.SegmentRefillWatermark)
 	}
+	if c.UUIDKey != "" {
+		if _, err := c.UUIDKeyBytes(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ListenAddr is the address the HTTP server binds: listen_address:listen_port, or every
+// interface when listen_address is empty.
+func (c *Config) ListenAddr() string {
+	return net.JoinHostPort(c.ListenAddress, strconv.Itoa(c.ListenPort))
+}
+
+// UUIDKeyBytes decodes uuid_key. It returns nil when no key is set.
+func (c *Config) UUIDKeyBytes() ([]byte, error) {
+	if c.UUIDKey == "" {
+		return nil, nil
+	}
+	b, err := hex.DecodeString(strings.TrimSpace(c.UUIDKey))
+	if err != nil {
+		return nil, fmt.Errorf("uuid_key must be hex: %w", err)
+	}
+	if n := len(b); n != 16 && n != 24 && n != 32 {
+		return nil, fmt.Errorf("uuid_key must be 32, 48 or 64 hex chars (16/24/32 bytes), got %d bytes", n)
+	}
+	return b, nil
 }

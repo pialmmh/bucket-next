@@ -1,8 +1,10 @@
 package forge
 
 import (
+	"errors"
 	"strconv"
 	"testing"
+	"time"
 )
 
 const testEpoch = 1704067200000
@@ -137,5 +139,54 @@ func TestStats_increment(t *testing.T) {
 	gen, _, _ := f.Stats()
 	if gen != 100 {
 		t.Errorf("generated=%d, want 100", gen)
+	}
+}
+
+func TestEnableMark_persistsLeaseBeforeUse(t *testing.T) {
+	f, _ := New(1, testEpoch, 0)
+	var saved int64
+	if err := f.EnableMark(0, func(ms int64) error { saved = ms; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		id, err := f.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := f.Parse(id)
+		if p.Timestamp >= saved {
+			t.Fatalf("ID timestamp %d not covered by saved lease %d", p.Timestamp, saved)
+		}
+	}
+}
+
+func TestEnableMark_waitsPastMark(t *testing.T) {
+	f, _ := New(1, testEpoch, 0)
+	mark := time.Now().UnixMilli() + 150 // a lease left by the previous run
+	start := time.Now()
+	if err := f.EnableMark(mark, func(int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 140*time.Millisecond {
+		t.Error("should have waited for the clock to pass the mark")
+	}
+	id, _ := f.Generate()
+	if p, _ := f.Parse(id); p.Timestamp <= mark {
+		t.Errorf("timestamp %d not after mark %d", p.Timestamp, mark)
+	}
+}
+
+func TestEnableMark_refusesFarBehindClock(t *testing.T) {
+	f, _ := New(1, testEpoch, 0)
+	if err := f.EnableMark(time.Now().UnixMilli()+60_000, func(int64) error { return nil }); err == nil {
+		t.Error("a clock 60 s behind the mark must be refused")
+	}
+}
+
+func TestEnableMark_persistFailureStopsMinting(t *testing.T) {
+	f, _ := New(1, testEpoch, 0)
+	f.EnableMark(0, func(int64) error { return errors.New("disk full") })
+	if _, err := f.Generate(); err == nil {
+		t.Error("must not mint when the lease cannot be saved")
 	}
 }

@@ -1,5 +1,7 @@
+# bucket-next — one instance per shard: bucket-next@<shard_id>.service
+# Config: /etc/bucket-next/shard-<shard_id>.yaml (rendered by deploy.sh)
 [Unit]
-Description=bucket-next ID Service (tenant=__TENANT__ profile=__PROFILE__ shard=__SHARD_ID__/__TOTAL_SHARDS__)
+Description=bucket-next ID service (shard %i)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +9,7 @@ Wants=network-online.target
 Type=simple
 User=bucket-next
 Group=bucket-next
-ExecStart=/opt/bucket-next/bucket-next -config /opt/bucket-next/config.yaml
+ExecStart=/opt/bucket-next/bucket-next -config /etc/bucket-next/shard-%i.yaml
 Restart=on-failure
 RestartSec=2
 StandardOutput=journal

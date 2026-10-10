@@ -17,11 +17,14 @@ import (
 	"github.com/telcobright/bucket-next/internal/forge"
 	"github.com/telcobright/bucket-next/internal/server"
 	"github.com/telcobright/bucket-next/internal/state"
+	"github.com/telcobright/bucket-next/internal/uuidgen"
 )
 
 func main() {
 	var cfgPath string
+	var initState bool
 	flag.StringVar(&cfgPath, "config", "", "path to YAML config file (required)")
+	flag.BoolVar(&initState, "init", false, "create the state file if it does not exist (first start of a brand-new shard only)")
 	flag.Parse()
 
 	// Positional fallback: `bucket-next path/to/config.yaml`
@@ -29,26 +32,60 @@ func main() {
 		cfgPath = flag.Arg(0)
 	}
 	if cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: bucket-next -config <path/to/config.yaml>")
+		fmt.Fprintln(os.Stderr, "usage: bucket-next -config <path/to/config.yaml> [-init]")
 		os.Exit(2)
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
-		os.Exit(1)
+		fail("config: %v", err)
 	}
 
-	st, err := state.Open(cfg.StatePath)
+	key, err := cfg.UUIDKeyBytes()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "state: %v\n", err)
-		os.Exit(1)
+		fail("config: %v", err)
+	}
+	if key == nil {
+		key = uuidgen.DefaultKey()
+		log.Printf("WARNING: uuid_key is not set — uuid IDs are unique but predictable to anyone with the source; " +
+			"set the same uuid_key on every shard before issuing uuid IDs in production")
+	}
+	codec, err := uuidgen.New(key)
+	if err != nil {
+		fail("uuid key: %v", err)
+	}
+
+	identity := state.Identity{
+		ShardID:            cfg.ShardID,
+		TotalShards:        cfg.TotalShards,
+		UUIDKeyFingerprint: codec.Fingerprint(),
+		SnowflakeEpochMs:   cfg.SnowflakeEpochMs,
+	}
+	st, err := state.Open(cfg.StatePath, identity)
+	if errors.Is(err, state.ErrNotFound) {
+		if !initState {
+			fail("state file %s not found. Refusing to start: starting from zero would re-issue IDs.\n"+
+				"If this is a brand-new shard, start it once with -init (or run: bucket-next-cli -config %s init-state).\n"+
+				"If the file was lost, restore it from backup instead.", cfg.StatePath, cfgPath)
+		}
+		st, err = state.Create(cfg.StatePath, identity)
+		if err == nil {
+			log.Printf("created new state file %s for shard %d/%d", cfg.StatePath, cfg.ShardID, cfg.TotalShards)
+		}
+	}
+	if err != nil {
+		fail("state: %v", err)
+	}
+	if st.MigratedFromV1() {
+		log.Printf("state file %s upgraded to format v2 (now bound to shard %d/%d)", cfg.StatePath, cfg.ShardID, cfg.TotalShards)
 	}
 
 	fg, err := forge.New(cfg.ShardID, cfg.SnowflakeEpochMs, cfg.ClockDriftToleranceMs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "forge: %v\n", err)
-		os.Exit(1)
+		fail("forge: %v", err)
+	}
+	if err := fg.EnableMark(st.SnowflakeMark(), st.RaiseSnowflakeMark); err != nil {
+		fail("forge: %v", err)
 	}
 
 	alloc := allocator.New(allocator.Config{
@@ -59,7 +96,7 @@ func main() {
 		Store:       st,
 	})
 
-	srv := server.New(cfg, st, fg, alloc)
+	srv := server.New(cfg, st, fg, alloc, codec)
 
 	// Graceful shutdown plumbing.
 	idleConnsClosed := make(chan struct{})
@@ -82,4 +119,9 @@ func main() {
 	}
 	<-idleConnsClosed
 	log.Println("bye")
+}
+
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }

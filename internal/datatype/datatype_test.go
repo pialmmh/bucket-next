@@ -69,3 +69,26 @@ func TestMaxValues(t *testing.T) {
 		t.Errorf("MaxLong = %d", MaxLong)
 	}
 }
+
+func TestIsCounter(t *testing.T) {
+	for _, d := range []DataType{Int, Long, UUID8, UUID12, UUID16, UUID22} {
+		if !d.IsCounter() {
+			t.Errorf("%s.IsCounter() = false", d)
+		}
+	}
+	if Snowflake.IsCounter() {
+		t.Error("snowflake.IsCounter() = true")
+	}
+}
+
+func TestMaxValue(t *testing.T) {
+	cases := map[DataType]int64{
+		Int: MaxInt, Long: MaxLong, UUID8: 218340105584895,
+		UUID12: MaxLong, UUID16: MaxLong, UUID22: MaxLong, Snowflake: 0,
+	}
+	for dt, want := range cases {
+		if got := dt.MaxValue(); got != want {
+			t.Errorf("%s.MaxValue()=%d, want %d", dt, got, want)
+		}
+	}
+}

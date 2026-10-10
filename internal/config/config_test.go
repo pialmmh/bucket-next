@@ -27,8 +27,8 @@ func TestLoad_minimalAppliesDefaults(t *testing.T) {
 	if c.SegmentSize != 1000 {
 		t.Errorf("default segment_size=%d, want 1000", c.SegmentSize)
 	}
-	if c.SegmentRefillWatermark != 0.9 {
-		t.Errorf("default watermark=%v, want 0.9", c.SegmentRefillWatermark)
+	if c.SegmentRefillWatermark != 0.5 {
+		t.Errorf("default watermark=%v, want 0.5", c.SegmentRefillWatermark)
 	}
 	if c.SnowflakeEpochMs != 1704067200000 {
 		t.Errorf("default epoch=%d, want 1704067200000", c.SnowflakeEpochMs)
@@ -63,14 +63,18 @@ snowflake_epoch_ms: 1500000000000
 
 func TestLoad_validationFailures(t *testing.T) {
 	cases := map[string]string{
-		"shard_id zero":          "shard_id: 0\ntotal_shards: 1\nstate_path: x\n",
-		"shard_id too large":     "shard_id: 2000\ntotal_shards: 2000\nstate_path: x\n",
-		"total_shards too large": "shard_id: 1\ntotal_shards: 2000\nstate_path: x\n",
-		"shard > total":          "shard_id: 5\ntotal_shards: 3\nstate_path: x\n",
-		"missing state_path":     "shard_id: 1\ntotal_shards: 1\n",
-		"watermark too high":     "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 1.5\n",
-		"watermark zero":         "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 0\n", // zero triggers default, no error
+		"shard_id zero":            "shard_id: 0\ntotal_shards: 1\nstate_path: x\n",
+		"shard_id too large":       "shard_id: 2000\ntotal_shards: 2000\nstate_path: x\n",
+		"total_shards too large":   "shard_id: 1\ntotal_shards: 2000\nstate_path: x\n",
+		"shard > total":            "shard_id: 5\ntotal_shards: 3\nstate_path: x\n",
+		"missing state_path":       "shard_id: 1\ntotal_shards: 1\n",
+		"watermark too high":       "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 1.5\n",
+		"watermark zero":           "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 0\n", // zero triggers default, no error
 		"listen_port out of range": "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_port: 70000\n",
+		"uuid_key not hex":         "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: zz\n",
+		"listen_address hostname":  "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_address: localhost\n",
+		"listen_address bad IP":    "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_address: 10.0.0.300\n",
+		"uuid_key wrong length":    "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: 00112233\n",
 	}
 	// The "watermark zero" case actually triggers the default — remove from negative cases.
 	delete(cases, "watermark zero")
@@ -95,5 +99,43 @@ func TestLoad_malformedYAML(t *testing.T) {
 	p := writeYAML(t, "shard_id: not-a-number\n")
 	if _, err := Load(p); err == nil {
 		t.Error("expected parse error on bad YAML")
+	}
+}
+
+func TestLoad_uuidKey(t *testing.T) {
+	p := writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: 00112233445566778899aabbccddeeff\n")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := c.UUIDKeyBytes(); len(b) != 16 {
+		t.Errorf("key bytes=%d, want 16", len(b))
+	}
+	p = writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_path: x\n")
+	c, _ = Load(p)
+	if b, err := c.UUIDKeyBytes(); b != nil || err != nil {
+		t.Errorf("no key set: got %v %v", b, err)
+	}
+}
+
+func TestLoad_listenAddress(t *testing.T) {
+	cases := map[string]string{
+		"":             ":7001",
+		"127.0.0.1":    "127.0.0.1:7001",
+		"10.10.199.11": "10.10.199.11:7001",
+		"::1":          "[::1]:7001",
+	}
+	for addr, want := range cases {
+		yaml := "shard_id: 1\ntotal_shards: 1\nstate_path: x\n"
+		if addr != "" {
+			yaml += "listen_address: \"" + addr + "\"\n"
+		}
+		c, err := Load(writeYAML(t, yaml))
+		if err != nil {
+			t.Fatalf("%q: %v", addr, err)
+		}
+		if got := c.ListenAddr(); got != want {
+			t.Errorf("listen_address %q: ListenAddr()=%q, want %q", addr, got, want)
+		}
 	}
 }
