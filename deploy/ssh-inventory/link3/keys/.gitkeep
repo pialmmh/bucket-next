@@ -1,3 +1,0 @@
-Drop private SSH keys (e.g. link3-deploy.pem) in this directory.
-Files matching *.pem and *.key in this tree are gitignored.
-File mode should be 0600.

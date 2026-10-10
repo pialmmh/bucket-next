@@ -1,8 +1,8 @@
 # Deployment guide
 
-How to deploy bucket-next to one or many servers. Routesphere-style: **one tenant config file
-per tenant, one section per profile (environment), one command pushes every shard of that
-profile over SSH.**
+How to deploy bucket-next to one or many servers, by the routesphere convention: **the service's config per tenant and
+profile, a tenant conf saying where it runs, the shared ssh inventory, and one command** that pushes every shard of the
+profile over SSH. The reference with every key: [tools/deploy/README.md](../tools/deploy/README.md).
 
 Shards never talk to each other at runtime (shard-interleaved counters, shard id in the
 Snowflake bits), so the deployer only needs SSH access to each shard's host.
@@ -13,20 +13,18 @@ Snowflake bits), so the deployer only needs SSH access to each shard's host.
 
 | Term | Meaning |
 |---|---|
-| **Tenant** | One logical cluster, e.g. `link3`. Has its own `deploy/tenants/<tenant>.conf`. |
-| **Profile** | An environment within the tenant: `dev`, `staging`, `prod`. One `[section]` per profile, listing every shard. |
+| **Tenant** | One logical cluster, e.g. `btcl`. |
+| **Profile** | An environment within the tenant: `bed`, `staging`, `prod`. |
 | **Shard** | One bucket-next process: systemd unit `bucket-next@<shard_id>`, numbered `1..total_shards`, fixed for life. |
-| **Inventory** | SSH details under `deploy/ssh-inventory/<inventory_tenant>/`. One file per host. |
+| **The service's config** | `config/tenants/<tenant>/<profile>/profile-<profile>.yml` — bucket-next's own keys, the same for every shard. |
+| **The tenant conf** | `tools/deploy/tenant-conf-v2/<tenant>.conf`, one `[profile]` section: which server, which shards are deployed. |
+| **Inventory** | The SHARED ssh inventory, by reference: `servers/<inventory_tenant>/hosts/<server>` and its `keys/`. Never copied here. |
 
 ```
-deploy/
-├── deploy.sh                       # the one command you run
-├── tenants/
-│   └── <tenant>.conf               # profiles + per-shard server mapping
-├── ssh-inventory/
-│   └── <inventory_tenant>/
-│       ├── hosts/<server-name>     # host=, port=, user=, key=, ...
-│       └── keys/                   # SSH keys + uuid key files (gitignored, mode 0600)
+config/tenants/<tenant>/<profile>/profile-<profile>.yml   # WHAT the service is configured with
+tools/deploy/
+├── remote-deploy-v2.sh             # the one command you run
+├── tenant-conf-v2/<tenant>.conf    # WHERE each profile runs
 └── dependencies/
     ├── bucket-next@.service        # systemd template unit, one instance per shard
     └── remote-setup.sh             # runs on the target host
@@ -45,7 +43,7 @@ On each target host:
 
 ## Prerequisites
 
-**On the machine you run `deploy.sh` from:** Go 1.21+, `ssh`, `scp`.
+**On the machine you run the deploy from:** Go 1.21+, `ssh`, `scp`, and the shared ssh inventory.
 
 **On each target host:**
 - SSH reachable with a key.
@@ -57,70 +55,33 @@ On each target host:
 
 ---
 
-## One-time setup for a new tenant
+## One-time setup for a new tenant or profile
 
-### 1. Tenant config — `deploy/tenants/<tenant>.conf`
+1. **The server** must be in the shared ssh inventory: `servers/<inventory_tenant>/hosts/<server>` with `host=`, `port=`,
+   `user=`, `key=`, `private_ip=`. If it is not there, add it THERE (it serves every deploy tool); never a copy here.
+2. **The service's config** — `config/tenants/<tenant>/<profile>/profile-<profile>.yml`:
 
-```ini
-[dev]
-description           = link3 dev cluster, 3 shards
-inventory_tenant      = link3
+   ```yaml
+   total_shards: 2                 # the cluster's size FOR LIFE; identical on every node
+   listen_address: 127.0.0.1       # or "{private_ip}" = each shard's host; the API has no authentication
+   listen_port: 7001
+   state_path: /var/lib/bucket-next/shard-{shard_id}/state.json
+   segment_size: 1000
+   segment_refill_watermark: 0.5
+   ```
 
-# Applied to every shard of this profile.
-listen_address        = private_ip
-listen_port           = 7001
-state_path            = /var/lib/bucket-next/shard-{shard_id}/state.json
-segment_size          = 1000
-segment_refill_watermark = 0.5
-snowflake_epoch_ms    = 1704067200000
-uuid_key_file         = ssh-inventory/link3/keys/uuid-dev.key
+3. **The tenant conf** — `tools/deploy/tenant-conf-v2/<tenant>.conf`:
 
-total_shards          = 3
-shard1.server         = link3-dev-1
-shard2.server         = link3-dev-2
-shard3.server         = link3-dev-3
-```
+   ```ini
+   [bed]
+   inventory_tenant = btcl
+   server           = radius2
+   shards           = 1            ; shard 2 is declared (total_shards 2) and deployed nowhere yet
+   ```
 
-| Key | Required | Notes |
-|---|---|---|
-| `inventory_tenant` | yes | sub-dir of `ssh-inventory/` holding the host files |
-| `total_shards` | yes | the cluster size the id space is partitioned for, fixed once; the `shardN.server` keys are numbered `1..K` without gaps with `K <= total_shards` (a declared, not yet deployed shard is added later as a line of its own) |
-| `shardN.server` | yes | host-file name for shard N |
-| `listen_address` | no | empty = all interfaces; an IP = that IP on every shard; `private_ip` = each shard binds the `private_ip` from its own host file (recommended for servers) |
-| `state_path` | no | `{shard_id}` is replaced per shard. Default `/var/lib/bucket-next/shard-{shard_id}/state.json` |
-| `uuid_key_file` | no | file with 32/48/64 hex chars, relative to `deploy/` or absolute. Same file for every shard. Unset = built-in key (unique but predictable) |
-| `listen_port`, `segment_size`, `segment_refill_watermark`, `clock_drift_tolerance_ms`, `snowflake_epoch_ms` | no | copied into each shard's config |
-
-Every `shardN.server` of a profile must have a host file, even when you deploy with
-`--shard`, because the script checks all shards for clashes first.
-
-### 2. SSH inventory — one host file per server
-
-`deploy/ssh-inventory/<inventory_tenant>/hosts/<server-name>`:
-
-```ini
-host=10.10.199.11
-port=22
-user=ubuntu
-key=link3-deploy.pem
-private_ip=10.10.199.11
-# Optional — this shard's port when two shards share the host
-#listen_port_override=7002
-```
-
-### 3. Keys (never committed)
-
-```bash
-cp ~/Downloads/link3-deploy.pem deploy/ssh-inventory/link3/keys/
-chmod 600 deploy/ssh-inventory/link3/keys/link3-deploy.pem
-
-# uuid key: once per profile, before the first uuid ID; never change it afterwards
-openssl rand -hex 16 > deploy/ssh-inventory/link3/keys/uuid-dev.key
-chmod 600 deploy/ssh-inventory/link3/keys/uuid-dev.key
-```
-
-`*.pem`, `*.key` and `id_*` under `ssh-inventory/**/keys/` are gitignored. **Back up the uuid
-key file**: losing it means uuid entities cannot continue without risking repeats.
+4. **A uuid key** (only when uuid ids will be issued): `openssl rand -hex 16` into a file OUTSIDE git, mode 0600, named by
+   `uuid_key_file` in the tenant conf. Set it before the first uuid id; it can never change. **Back it up**: losing it
+   means uuid entities cannot continue without risking repeats.
 
 ---
 
@@ -132,7 +93,7 @@ Prints the plan and the exact config each shard would get (uuid key hidden), wit
 contacting any host:
 
 ```bash
-./deploy/deploy.sh link3 dev --dry-run
+tools/deploy/remote-deploy-v2.sh btcl bed --dry-run
 ```
 
 Check each shard's server, port and state path.
@@ -143,7 +104,7 @@ New shards have no state file, and the service refuses to start without one. Cre
 the first deploy:
 
 ```bash
-./deploy/deploy.sh link3 dev --init-state
+tools/deploy/remote-deploy-v2.sh btcl bed --init-state
 ```
 
 `--init-state` only creates **missing** files; it never touches an existing one. Do **not** use
@@ -152,10 +113,11 @@ it to "fix" a shard whose state file was lost — restore that file from backup 
 ### Normal deploys
 
 ```bash
-./deploy/deploy.sh link3 dev                    # every shard, in order
-./deploy/deploy.sh link3 prod --shard 4         # one shard
-./deploy/deploy.sh link3 staging --skip-build   # reuse bin/ (run `make build` first)
-./deploy/deploy.sh --list                       # tenants and profiles
+tools/deploy/remote-deploy-v2.sh btcl bed                 # every deployed shard, in order
+tools/deploy/remote-deploy-v2.sh btcl bed --shard 1       # one shard
+tools/deploy/remote-deploy-v2.sh btcl bed --skip-build    # reuse bin/ (run `make build` first)
+tools/deploy/remote-deploy-v2.sh --list                   # tenants and profiles
+# add --yes to skip the question before the server is touched
 ```
 
 ---
@@ -163,14 +125,16 @@ it to "fix" a shard whose state file was lost — restore that file from backup 
 ## What happens
 
 Before contacting any host, the script checks:
-- every shard has a host file, and shards are numbered `1..total_shards`;
+- the three files of the tenant + profile exist, and the profile YAML states only keys the service reads;
+- every deployed shard is one of `1..total_shards` and its server has a host file in the shared inventory (a shard of
+  the cluster that is not deployed is named in the plan as DECLARED, NOT DEPLOYED);
+- a profile with `deploy = false` is planned, never deployed;
 - no two shards use the **same host + port**, or the **same host + state file**;
 - the uuid key file exists and holds valid hex.
 
 Then, per shard:
 1. **Build once**: `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build` → `bin/`.
-2. **Render** `config.yaml` with this shard's `shard_id`, port and state path, plus the
-   profile's settings and uuid key.
+2. **Render** `config.yaml` from the profile YAML with this shard's `shard_id`, port and state path, and the uuid key.
 3. **Copy** binaries, config, `bucket-next@.service` and `remote-setup.sh` over one multiplexed
    SSH connection.
 4. **`remote-setup.sh`** on the host:
@@ -213,27 +177,20 @@ sudo journalctl -u bucket-next@2 -f
 
 ## Two shards on one host
 
-Point two `shardN.server` keys at two host files for the same machine, with different
-`listen_port_override` values. Each shard gets its own unit (`bucket-next@1`, `bucket-next@2`),
-config and state file (`{shard_id}` in `state_path`):
+Deploy both ids and give one its own port; each shard gets its own unit (`bucket-next@1`, `bucket-next@2`), config and
+state file (`{shard_id}` in `state_path`):
 
 ```ini
-# tenants/tcteltd.conf
+# tools/deploy/tenant-conf-v2/<tenant>.conf
 [dev]
-inventory_tenant = tcteltd
-total_shards     = 2
-state_path       = /var/lib/bucket-next/shard-{shard_id}/state.json
-shard1.server    = tcteltd-dev-1a
-shard2.server    = tcteltd-dev-1b
+inventory_tenant   = <tenant>
+server             = <server>
+shards             = 1,2
+shard2.listen_port = 7002
 ```
 
-```ini
-# ssh-inventory/tcteltd/hosts/tcteltd-dev-1a      # ssh-inventory/tcteltd/hosts/tcteltd-dev-1b
-host=10.10.198.5                                  host=10.10.198.5
-listen_port_override=7001                         listen_port_override=7002
-```
-
-If two shards would share a port or a state file, `deploy.sh` stops before touching anything.
+Two shards on two hosts: `shard2.server = <other-server>`. If two shards would share a port or a state file, the script
+stops before touching anything.
 
 ---
 
@@ -247,7 +204,7 @@ If two shards would share a port or a state file, `deploy.sh` stops before touch
 
   ```bash
   git checkout <previous-tag>
-  ./deploy/deploy.sh link3 prod --shard <n>
+  tools/deploy/remote-deploy-v2.sh <tenant> <profile> --shard <n>
   git checkout main
   ```
 
@@ -260,26 +217,19 @@ If two shards would share a port or a state file, `deploy.sh` stops before touch
 
 | Symptom | Likely cause |
 |---|---|
-| `ERROR: tenant config not found` | Wrong tenant name; run `./deploy/deploy.sh --list`. |
-| `ERROR: profile '<x>' not found` | Section missing in the tenant `.conf`. |
-| `ERROR: total_shards=N but found M shardN.server entries` | Count mismatch in the `.conf`. |
-| `ERROR: shard N: host file not found` | Every shard of the profile needs a host file. |
-| `ERROR: shards 1 and 2 both listen on …` | Same host + port: set `listen_port_override`. |
-| `ERROR: shards 1 and 2 share state file …` | Put `{shard_id}` in `state_path`. |
-| `ERROR: SSH key not found` | Key missing in `ssh-inventory/<tenant>/keys/`, or `key=` wrong. |
+| `ERROR: tenant conf not found` | Wrong tenant name; run `tools/deploy/remote-deploy-v2.sh --list`. |
+| `ERROR: profile '<x>' not found` | Section missing in the tenant conf. |
+| `ERROR: the service's config for <t>/<p> is missing` | No `config/tenants/<t>/<p>/profile-<p>.yml`. |
+| `ERROR: ... is not a key bucket-next reads` | A mistyped key in the profile YAML. |
+| `ERROR: ... states shard_id` | `shard_id` belongs to the deploy (the tenant conf's `shards`), not the profile YAML. |
+| `ERROR: [p].shards: 'N' is not a shard of this cluster` | An id beyond `total_shards`. |
+| `ERROR: shard N: no host file for server` | The server is not in the shared inventory; add it there. |
+| `ERROR: shards 1 and 2 both listen on …` | Same host + port: set `shard<N>.listen_port`. |
+| `ERROR: shards 1 and 2 share the state file …` | Put `{shard_id}` in `state_path`. |
+| `ERROR: [p].deploy = false` | The profile is declared, not deployed. |
+| `ERROR: ssh key not found` | The key named by the host file is not under the inventory's `keys/`. |
 | `Permission denied (publickey)` | Wrong key or `user=`, or key not authorized on the host. |
 | `sudo: a password is required` | The SSH user lacks passwordless sudo. |
 | `[remote] ERROR: state file … does not exist` | First deploy → add `--init-state`. Lost file → restore from backup. |
 | unit fails; journal says `does not belong to this config` | Wrong state file for this shard, or `total_shards` / uuid key / epoch changed. Fix the config. |
 | unit fails; journal says `clock is … behind the last persisted snowflake mark` | The host clock jumped back. Fix NTP. |
-
----
-
-## Security notes
-
-- Keys live only under `ssh-inventory/**/keys/` (gitignored). Never commit them.
-- Rendered configs on hosts are `0640 root:bucket-next` because they may hold the uuid key.
-- The service has **no authentication**. Set `listen_address = private_ip` (or an explicit IP) so
-  it never binds a public interface, and firewall the port. The plan line `Bind:` warns when a
-  profile binds every interface.
-- The scripts contain **no passwords**; they need key-based SSH and passwordless sudo.

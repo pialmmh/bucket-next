@@ -3,7 +3,7 @@
 BIN_DIR := bin
 
 # Always rebuild (go build is incremental). A file target here would skip the build when
-# bin/ already exists and leave a stale binary for `deploy.sh --skip-build` to ship.
+# bin/ already exists and leave a stale binary for `remote-deploy-v2.sh --skip-build` to ship.
 build: service cli
 
 service:

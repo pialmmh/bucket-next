@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# remote-setup.sh — runs on the target server after deploy.sh copied the files.
+# remote-setup.sh — runs on the target server after remote-deploy-v2.sh copied the files.
 # Installs one shard: binaries, its config, the template systemd unit, then starts
 # bucket-next@<shard_id>. Several shards can live on one host; each has its own unit,
 # config and state file.
@@ -38,6 +38,7 @@ sudo install -m 0755 -o root -g root "$REMOTE_TMP/bucket-next-cli" "$INSTALL_DIR
 
 echo "  [remote] Installing config $CONF (0640, may hold the uuid key)..."
 sudo install -m 0640 -o root -g "$SERVICE_USER" "$REMOTE_TMP/config.yaml" "$CONF"
+[ ! -f "$REMOTE_TMP/version.txt" ] || sudo install -m 0644 -o root -g root "$REMOTE_TMP/version.txt" "$INSTALL_DIR/version-shard-$SHARD_ID.txt"
 
 STATE_DIR="$(dirname "$STATE_PATH")"
 echo "  [remote] Ensuring state dir $STATE_DIR..."

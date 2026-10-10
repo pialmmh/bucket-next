@@ -3,8 +3,7 @@ data/
 configs/dev.yaml
 configs/*.local.yaml
 
-# SSH inventory — private keys never leave the machine.
-deploy/ssh-inventory/**/keys/*.pem
-deploy/ssh-inventory/**/keys/*.key
-deploy/ssh-inventory/**/keys/id_*
-!deploy/ssh-inventory/**/keys/.gitkeep
+# The ssh inventory is the SHARED one, by reference (tools/deploy/remote-deploy-v2.sh): no key is ever in this repository.
+# A uuid key file named by a tenant conf lives outside git; if one is kept beside the conf, it is ignored here.
+tools/deploy/keys/
+*.uuid.key

@@ -1,0 +1,14 @@
+# bucket-next — tenant btcl, profile prod (radius1). DECLARED, NOT DEPLOYED: nothing of this is on production
+# (the owner, 2026-10-10). tools/deploy/tenant-conf-v2/btcl.conf [prod] says deploy = false; the script then only plans.
+# Keys and the two per-shard words: see ../bed/profile-bed.yml.
+total_shards: 2
+
+# its one client is the production prime-context on the same box; review the bind with the owner before the first deploy
+listen_address: 127.0.0.1
+listen_port: 7001
+state_path: /var/lib/bucket-next/shard-{shard_id}/state.json
+
+segment_size: 10000
+segment_refill_watermark: 0.5
+clock_drift_tolerance_ms: 0
+snowflake_epoch_ms: 1704067200000

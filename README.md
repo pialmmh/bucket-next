@@ -563,26 +563,28 @@ Details: [docs/cli.md](docs/cli.md).
 
 ## Deployment
 
-Routesphere-style: one tenant config per tenant, one section per profile, one command for every
-shard of a profile over SSH. Each shard runs as systemd unit `bucket-next@<shard_id>` with its
+The routesphere convention: the service's config per tenant and profile (`config/tenants/<tenant>/<profile>/`), a
+tenant conf saying where each profile runs (`tools/deploy/tenant-conf-v2/<tenant>.conf`), the shared ssh inventory by
+reference, and one command for every deployed shard of a profile over SSH. Each shard runs as systemd unit `bucket-next@<shard_id>` with its
 own config and state file, so several shards can share a host.
 
 ```bash
-./deploy/deploy.sh --list
-./deploy/deploy.sh link3 dev --dry-run        # plan + rendered configs, no SSH
-./deploy/deploy.sh link3 dev --init-state     # first deploy: create the state files
-./deploy/deploy.sh link3 dev                  # later deploys
-./deploy/deploy.sh link3 prod --shard 4       # one shard
+tools/deploy/remote-deploy-v2.sh --list
+tools/deploy/remote-deploy-v2.sh btcl bed --dry-run        # plan + rendered configs, no SSH
+tools/deploy/remote-deploy-v2.sh btcl bed --init-state     # first deploy: create the state file
+tools/deploy/remote-deploy-v2.sh btcl bed                  # later deploys
+tools/deploy/remote-deploy-v2.sh btcl bed --shard 1        # one shard
 ```
 
 Before touching any host the script checks shard numbering, host files, port and state-file
 clashes, and the uuid key file. After each start it checks that `/shard-info` reports the
 deployed `shardId` and `totalShards`. Target hosts need passwordless sudo, `systemd` and `curl`.
 
-In a tenant profile, `listen_address = private_ip` makes every shard bind its own host's
-`private_ip` from the inventory; a literal IP (e.g. `127.0.0.1`) applies to all shards.
+In a profile's YAML, `listen_address: "{private_ip}"` makes every shard bind its own host's `private_ip` from the
+inventory; a literal IP (e.g. `127.0.0.1`) applies to all shards. A cluster that will grow is declared at its final
+`total_shards` and deploys only the shards that run today (`shards = 1`): the count is fixed for life.
 
-Details: [docs/deployment.md](docs/deployment.md) · [deploy/README.md](deploy/README.md).
+Details: [docs/deployment.md](docs/deployment.md) · [tools/deploy/README.md](tools/deploy/README.md).
 
 ---
 
@@ -619,7 +621,8 @@ internal/uuidgen/        counter → fixed-length string (keyed Feistel permutat
 internal/forge/          Snowflake with a persisted time lease
 internal/server/         HTTP handlers
 configs/sample.yaml      every config key with its default
-deploy/                  tenant configs, SSH inventory, deploy.sh
+config/tenants/          the service's config per tenant and profile
+tools/deploy/            tenant-conf-v2 (where it runs), remote-deploy-v2.sh, the unit
 docs/                    detailed guides
 ```
 

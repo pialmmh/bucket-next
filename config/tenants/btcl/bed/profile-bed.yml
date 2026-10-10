@@ -1,0 +1,27 @@
+# bucket-next — tenant btcl, profile bed (the wifi bed: bras-2 + BSS2 on radius2).
+# This is the service's own config (docs/configuration.md), stated once for every shard of the profile.
+# The deploy writes two things per shard, so they are NOT keys here:
+#   shard_id            the shard's number (from tools/deploy/tenant-conf-v2/btcl.conf: which shards are deployed, and where)
+#   uuid_key            from the profile's uuid_key_file, when it names one (never in git)
+# and replaces two words inside a value:
+#   {shard_id}          the shard's number            {private_ip}   the private_ip of the shard's host in the ssh inventory
+#
+# The owner + the routesphere architect, 2026-10-10 (wifi master docs/agents/design/wifi-session-ledger-agreement-2026-10-10.md, (b)):
+# ONE running shard of a declared TWO. The state file is bound to total_shards and the id space is split by it: a lone
+# count of 1 could never grow without re-initialising a counter that has minted. A second shard later is its own entry
+# in the tenant conf and its own first --init-state; this number never changes.
+total_shards: 2
+
+# Loopback only: the API has no authentication and its one client, prime-context-core-s2, runs on the same box
+# (primecontext.ids.shards=http://127.0.0.1:7001).
+listen_address: 127.0.0.1
+listen_port: 7001
+
+# One file per shard; initialised ONCE (--init-state on the first deploy) and never again after a mint.
+state_path: /var/lib/bucket-next/shard-{shard_id}/state.json
+
+segment_size: 1000
+segment_refill_watermark: 0.5
+clock_drift_tolerance_ms: 0
+# identical on every node of the cluster, never changed (2024-01-01 UTC)
+snowflake_epoch_ms: 1704067200000

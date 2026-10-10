@@ -15,7 +15,7 @@ Repository: `git@github.com:pialmmh/bucket-next.git`
 | [api-reference.md](api-reference.md) | All 11 HTTP endpoints — params, example responses, errors. |
 | [configuration.md](configuration.md) | Every YAML key, defaults, validation, the state-file identity check. |
 | [cli.md](cli.md) | `bucket-next-cli` for offline state maintenance. |
-| [deployment.md](deployment.md) | Multi-node deploy: tenants, profiles, SSH inventory, `deploy.sh`. |
+| [deployment.md](deployment.md) | Multi-node deploy by the routesphere convention: config per tenant and profile, the tenant conf, the shared SSH inventory, `tools/deploy/remote-deploy-v2.sh`. |
 
 ## 30-second mental model
 

@@ -1,5 +1,5 @@
 # bucket-next — one instance per shard: bucket-next@<shard_id>.service
-# Config: /etc/bucket-next/shard-<shard_id>.yaml (rendered by deploy.sh)
+# Config: /etc/bucket-next/shard-<shard_id>.yaml (rendered by tools/deploy/remote-deploy-v2.sh from config/tenants/<tenant>/<profile>/)
 [Unit]
 Description=bucket-next ID service (shard %i)
 After=network-online.target
@@ -16,11 +16,14 @@ StandardOutput=journal
 StandardError=journal
 LimitNOFILE=65536
 
-# Hardening
+# Hardening. The state lives under /var/lib/bucket-next (systemd makes it, owned by the service user); the service
+# writes nowhere else, and the unit holds no password.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+StateDirectory=bucket-next
+StateDirectoryMode=0750
 ReadWritePaths=/var/lib/bucket-next
 
 [Install]
