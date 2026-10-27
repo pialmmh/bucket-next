@@ -87,5 +87,5 @@ The ssh user needs passwordless `sudo`; the host needs `systemd` and `curl`. Not
 
 | tenant | profile | where | state |
 |---|---|---|---|
-| btcl | bed | radius2, `127.0.0.1:7001`, shard 1 of a declared 2 | the wifi bed; its client is `prime-context-core-s2` (`primecontext.ids.shards=http://127.0.0.1:7001`) |
+| btcl | bed | radius2, `10.10.188.2:7001`, shard 1 of a declared 2 | the wifi bed; clients `prime-context-core-s2` (`primecontext.ids.shards=http://10.10.188.2:7001`) and, from L3, `ad-sphere-s2` |
 | btcl | prod | radius1 | DECLARED, NOT DEPLOYED (`deploy = false`) |

@@ -12,9 +12,12 @@
 # in the tenant conf and its own first --init-state; this number never changes.
 total_shards: 2
 
-# Loopback only: the API has no authentication and its one client, prime-context-core-s2, runs on the same box
-# (primecontext.ids.shards=http://127.0.0.1:7001).
-listen_address: 127.0.0.1
+# radius-2's bed (s2/pair2) service address, like every other bed service on the box - the house bind rule
+# (10.10.x.x, never 0.0.0.0, loopback or a public address). The API has no authentication: this address is
+# reachable only on radius-2 and over the 10.10 service routes. Clients: prime-context-core-s2
+# (primecontext.ids.shards=http://10.10.188.2:7001) and, from round L3, ad-sphere-s2.
+# The owner, 2026-10-27: moved from 127.0.0.1 to 10.10.188.2.
+listen_address: 10.10.188.2
 listen_port: 7001
 
 # One file per shard; initialised ONCE (--init-state on the first deploy) and never again after a mint.
