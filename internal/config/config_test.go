@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -16,7 +17,7 @@ func writeYAML(t *testing.T, content string) string {
 }
 
 func TestLoad_minimalAppliesDefaults(t *testing.T) {
-	p := writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_path: ./s.json\n")
+	p := writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_dir: ./s\ntenants: [btcl]\n")
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +40,9 @@ func TestLoad_explicitValuesOverrideDefaults(t *testing.T) {
 	p := writeYAML(t, `
 shard_id: 3
 total_shards: 5
-state_path: /var/lib/bn/state.json
+state_dir: /var/lib/bn/shard-3
+tenants: [btcl, acme]
+legacy_tenant: btcl
 listen_port: 9000
 segment_size: 250
 segment_refill_watermark: 0.5
@@ -63,18 +66,25 @@ snowflake_epoch_ms: 1500000000000
 
 func TestLoad_validationFailures(t *testing.T) {
 	cases := map[string]string{
-		"shard_id zero":            "shard_id: 0\ntotal_shards: 1\nstate_path: x\n",
-		"shard_id too large":       "shard_id: 2000\ntotal_shards: 2000\nstate_path: x\n",
-		"total_shards too large":   "shard_id: 1\ntotal_shards: 2000\nstate_path: x\n",
-		"shard > total":            "shard_id: 5\ntotal_shards: 3\nstate_path: x\n",
-		"missing state_path":       "shard_id: 1\ntotal_shards: 1\n",
-		"watermark too high":       "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 1.5\n",
-		"watermark zero":           "shard_id: 1\ntotal_shards: 1\nstate_path: x\nsegment_refill_watermark: 0\n", // zero triggers default, no error
-		"listen_port out of range": "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_port: 70000\n",
-		"uuid_key not hex":         "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: zz\n",
-		"listen_address hostname":  "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_address: localhost\n",
-		"listen_address bad IP":    "shard_id: 1\ntotal_shards: 1\nstate_path: x\nlisten_address: 10.0.0.300\n",
-		"uuid_key wrong length":    "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: 00112233\n",
+		"shard_id zero":            "shard_id: 0\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\n",
+		"shard_id too large":       "shard_id: 2000\ntotal_shards: 2000\nstate_dir: x\ntenants: [btcl]\n",
+		"total_shards too large":   "shard_id: 1\ntotal_shards: 2000\nstate_dir: x\ntenants: [btcl]\n",
+		"shard > total":            "shard_id: 5\ntotal_shards: 3\nstate_dir: x\ntenants: [btcl]\n",
+		"missing state_dir":        "shard_id: 1\ntotal_shards: 1\ntenants: [btcl]\n",
+		"missing tenants":          "shard_id: 1\ntotal_shards: 1\nstate_dir: x\n",
+		"empty tenants":            "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: []\n",
+		"tenant in capitals":       "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [BTCL]\n",
+		"tenant with underscore":   "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [bt_cl]\n",
+		"tenant twice":             "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl, btcl]\n",
+		"legacy not a tenant":      "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nlegacy_tenant: acme\n",
+		"tenants as a scalar":      "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: btcl\n",
+		"watermark too high":       "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nsegment_refill_watermark: 1.5\n",
+		"watermark zero":           "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nsegment_refill_watermark: 0\n", // zero triggers default, no error
+		"listen_port out of range": "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nlisten_port: 70000\n",
+		"uuid_key not hex":         "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nuuid_key: zz\n",
+		"listen_address hostname":  "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nlisten_address: localhost\n",
+		"listen_address bad IP":    "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nlisten_address: 10.0.0.300\n",
+		"uuid_key wrong length":    "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nuuid_key: 00112233\n",
 	}
 	// The "watermark zero" case actually triggers the default — remove from negative cases.
 	delete(cases, "watermark zero")
@@ -103,7 +113,7 @@ func TestLoad_malformedYAML(t *testing.T) {
 }
 
 func TestLoad_uuidKey(t *testing.T) {
-	p := writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_path: x\nuuid_key: 00112233445566778899aabbccddeeff\n")
+	p := writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\nuuid_key: 00112233445566778899aabbccddeeff\n")
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +121,7 @@ func TestLoad_uuidKey(t *testing.T) {
 	if b, _ := c.UUIDKeyBytes(); len(b) != 16 {
 		t.Errorf("key bytes=%d, want 16", len(b))
 	}
-	p = writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_path: x\n")
+	p = writeYAML(t, "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\n")
 	c, _ = Load(p)
 	if b, err := c.UUIDKeyBytes(); b != nil || err != nil {
 		t.Errorf("no key set: got %v %v", b, err)
@@ -126,7 +136,7 @@ func TestLoad_listenAddress(t *testing.T) {
 		"::1":          "[::1]:7001",
 	}
 	for addr, want := range cases {
-		yaml := "shard_id: 1\ntotal_shards: 1\nstate_path: x\n"
+		yaml := "shard_id: 1\ntotal_shards: 1\nstate_dir: x\ntenants: [btcl]\n"
 		if addr != "" {
 			yaml += "listen_address: \"" + addr + "\"\n"
 		}
@@ -137,5 +147,25 @@ func TestLoad_listenAddress(t *testing.T) {
 		if got := c.ListenAddr(); got != want {
 			t.Errorf("listen_address %q: ListenAddr()=%q, want %q", addr, got, want)
 		}
+	}
+}
+
+func TestLoad_tenantKeys(t *testing.T) {
+	c, err := Load(writeYAML(t, "shard_id: 1\ntotal_shards: 2\nstate_dir: /var/lib/bucket-next/shard-1\ntenants: [btcl, acme]\nlegacy_tenant: btcl\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Tenants) != 2 || c.Tenants[0] != "btcl" || c.Tenants[1] != "acme" || c.LegacyTenant != "btcl" {
+		t.Errorf("tenants=%v legacy=%q", c.Tenants, c.LegacyTenant)
+	}
+	if c.StateDir != "/var/lib/bucket-next/shard-1" {
+		t.Errorf("state_dir=%q", c.StateDir)
+	}
+}
+
+func TestLoad_statePathIsRefusedNamingStateDir(t *testing.T) {
+	_, err := Load(writeYAML(t, "shard_id: 1\ntotal_shards: 2\nstate_path: /var/lib/bucket-next/shard-1/state.json\ntenants: [btcl]\n"))
+	if err == nil || !strings.Contains(err.Error(), "state_dir: /var/lib/bucket-next/shard-1") {
+		t.Fatalf("want the state_dir pointer, got %v", err)
 	}
 }

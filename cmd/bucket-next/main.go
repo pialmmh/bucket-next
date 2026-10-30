@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/telcobright/bucket-next/internal/allocator"
 	"github.com/telcobright/bucket-next/internal/config"
 	"github.com/telcobright/bucket-next/internal/forge"
 	"github.com/telcobright/bucket-next/internal/server"
@@ -24,7 +23,7 @@ func main() {
 	var cfgPath string
 	var initState bool
 	flag.StringVar(&cfgPath, "config", "", "path to YAML config file (required)")
-	flag.BoolVar(&initState, "init", false, "create the state file if it does not exist (first start of a brand-new shard only)")
+	flag.BoolVar(&initState, "init", false, "create the shard's state when its directory holds none (first start of a brand-new shard only)")
 	flag.Parse()
 
 	// Positional fallback: `bucket-next path/to/config.yaml`
@@ -61,42 +60,34 @@ func main() {
 		UUIDKeyFingerprint: codec.Fingerprint(),
 		SnowflakeEpochMs:   cfg.SnowflakeEpochMs,
 	}
-	st, err := state.Open(cfg.StatePath, identity)
+	lay, err := state.Open(state.Options{
+		Dir:          cfg.StateDir,
+		Identity:     identity,
+		Tenants:      cfg.Tenants,
+		LegacyTenant: cfg.LegacyTenant,
+		Create:       initState,
+	})
 	if errors.Is(err, state.ErrNotFound) {
-		if !initState {
-			fail("state file %s not found. Refusing to start: starting from zero would re-issue IDs.\n"+
-				"If this is a brand-new shard, start it once with -init (or run: bucket-next-cli -config %s init-state).\n"+
-				"If the file was lost, restore it from backup instead.", cfg.StatePath, cfgPath)
-		}
-		st, err = state.Create(cfg.StatePath, identity)
-		if err == nil {
-			log.Printf("created new state file %s for shard %d/%d", cfg.StatePath, cfg.ShardID, cfg.TotalShards)
-		}
+		fail("%v\nRefusing to start: starting from zero would re-issue IDs.\n"+
+			"If this is a brand-new shard, start it once with -init (or run: bucket-next-cli -config %s init-state).\n"+
+			"If the state was lost, restore it from backup instead.", err, cfgPath)
 	}
 	if err != nil {
 		fail("state: %v", err)
 	}
-	if st.MigratedFromV1() {
-		log.Printf("state file %s upgraded to format v2 (now bound to shard %d/%d)", cfg.StatePath, cfg.ShardID, cfg.TotalShards)
+	for _, note := range lay.Notes {
+		log.Printf("state %s: %s", cfg.StateDir, note)
 	}
 
 	fg, err := forge.New(cfg.ShardID, cfg.SnowflakeEpochMs, cfg.ClockDriftToleranceMs)
 	if err != nil {
 		fail("forge: %v", err)
 	}
-	if err := fg.EnableMark(st.SnowflakeMark(), st.RaiseSnowflakeMark); err != nil {
+	if err := fg.EnableMark(lay.Shard.SnowflakeMark(), lay.Shard.RaiseSnowflakeMark); err != nil {
 		fail("forge: %v", err)
 	}
 
-	alloc := allocator.New(allocator.Config{
-		ShardID:     cfg.ShardID,
-		TotalShards: cfg.TotalShards,
-		SegmentSize: cfg.SegmentSize,
-		Watermark:   cfg.SegmentRefillWatermark,
-		Store:       st,
-	})
-
-	srv := server.New(cfg, st, fg, alloc, codec)
+	srv := server.New(cfg, lay, fg, codec)
 
 	// Graceful shutdown plumbing.
 	idleConnsClosed := make(chan struct{})
@@ -110,7 +101,8 @@ func main() {
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}
-		alloc.Close() // wait for in-flight segment refills
+		srv.Close() // wait for every tenant's in-flight segment refills
+		lay.Close() // release the state directory's lock
 		close(idleConnsClosed)
 	}()
 

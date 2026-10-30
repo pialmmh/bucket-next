@@ -16,14 +16,20 @@ func testIdentity(shardID, total int) state.Identity {
 	return state.Identity{ShardID: shardID, TotalShards: total, UUIDKeyFingerprint: "fp", SnowflakeEpochMs: 1}
 }
 
-func newStore(t *testing.T, shardID, total int) (*state.Store, string) {
+// newStore opens a brand-new shard state with one tenant and returns that tenant's store and
+// the layout (Close it before opening the directory again: it holds the lock).
+func newStore(t *testing.T, shardID, total int) (*state.Store, *state.Layout) {
 	t.Helper()
-	path := filepath.Join(testutil.TempDir(t), "s.json")
-	st, err := state.Create(path, testIdentity(shardID, total))
+	l, err := state.Open(storeOpts(filepath.Join(testutil.TempDir(t), "shard"), shardID, total, true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return st, path
+	t.Cleanup(func() { l.Close() })
+	return l.Tenants["btcl"], l
+}
+
+func storeOpts(dir string, shardID, total int, create bool) state.Options {
+	return state.Options{Dir: dir, Identity: testIdentity(shardID, total), Tenants: []string{"btcl"}, Create: create}
 }
 
 func newAlloc(t *testing.T, st *state.Store, shardID, total, segment int, watermark float64) *Allocator {
@@ -169,7 +175,7 @@ func TestBatch_contiguousAcrossSegments(t *testing.T) {
 }
 
 func TestRestart_forfeitsTailNeverRepeats(t *testing.T) {
-	st, path := newStore(t, 2, 3)
+	st, l := newStore(t, 2, 3)
 	register(t, st, "x", datatype.Long, 0)
 	a := New(Config{ShardID: 2, TotalShards: 3, SegmentSize: 10, Watermark: 0.99, Store: st})
 	for i := 0; i < 4; i++ {
@@ -179,11 +185,13 @@ func TestRestart_forfeitsTailNeverRepeats(t *testing.T) {
 	if m := mark(st, "x"); m != 10 {
 		t.Fatalf("pre-crash mark=%d, want 10", m)
 	}
-	st2, err := state.Open(path, testIdentity(2, 3))
+	l.Close()
+	l2, err := state.Open(storeOpts(l.Dir, 2, 3, false))
 	if err != nil {
 		t.Fatal(err)
 	}
-	a2 := newAlloc(t, st2, 2, 3, 10, 0.99)
+	t.Cleanup(func() { l2.Close() })
+	a2 := newAlloc(t, l2.Tenants["btcl"], 2, 3, 10, 0.99)
 	first, _ := a2.Next("x", datatype.Long, 1)
 	if first != 10 || a2.Layout().Value(first) != 32 {
 		t.Errorf("after restart: iter %d value %d, want iter 10 value 32", first, a2.Layout().Value(first))

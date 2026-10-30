@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/telcobright/bucket-next/internal/allocator"
 	"github.com/telcobright/bucket-next/internal/config"
 	"github.com/telcobright/bucket-next/internal/datatype"
 	"github.com/telcobright/bucket-next/internal/forge"
@@ -47,45 +46,52 @@ func newTestServerSeg(t *testing.T, shardID, totalShards, segment int, watermark
 	return &harness{Server: ts, codec: codec, cfg: cfg}
 }
 
+// testConfig serves two tenants, btcl and acme; the pre-tenant roads act on btcl.
 func testConfig(t *testing.T, shardID, totalShards, segment int, watermark float64) *config.Config {
 	t.Helper()
 	return &config.Config{
 		ShardID:                shardID,
 		TotalShards:            totalShards,
-		StatePath:              filepath.Join(testutil.TempDir(t), "s.json"),
+		StateDir:               filepath.Join(testutil.TempDir(t), "shard"),
+		Tenants:                []string{"btcl", "acme"},
+		LegacyTenant:           "btcl",
 		SegmentSize:            segment,
 		SegmentRefillWatermark: watermark,
 		SnowflakeEpochMs:       1704067200000,
 	}
 }
 
-// buildServer wires a real Server (fresh state file, forge, allocator, codec) for cfg.
+// buildServer wires a real Server (a brand-new shard state, forge, codec) for cfg.
 func buildServer(t *testing.T, cfg *config.Config) (*Server, *uuidgen.Codec) {
 	t.Helper()
 	codec, err := uuidgen.New(uuidgen.DefaultKey())
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := state.Create(cfg.StatePath, state.Identity{
-		ShardID: cfg.ShardID, TotalShards: cfg.TotalShards,
-		UUIDKeyFingerprint: codec.Fingerprint(), SnowflakeEpochMs: cfg.SnowflakeEpochMs,
+	l, err := state.Open(state.Options{
+		Dir: cfg.StateDir,
+		Identity: state.Identity{
+			ShardID: cfg.ShardID, TotalShards: cfg.TotalShards,
+			UUIDKeyFingerprint: codec.Fingerprint(), SnowflakeEpochMs: cfg.SnowflakeEpochMs,
+		},
+		Tenants:      cfg.Tenants,
+		LegacyTenant: cfg.LegacyTenant,
+		Create:       true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { l.Close() })
 	fg, err := forge.New(cfg.ShardID, cfg.SnowflakeEpochMs, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fg.EnableMark(st.SnowflakeMark(), st.RaiseSnowflakeMark); err != nil {
+	if err := fg.EnableMark(l.Shard.SnowflakeMark(), l.Shard.RaiseSnowflakeMark); err != nil {
 		t.Fatal(err)
 	}
-	alloc := allocator.New(allocator.Config{
-		ShardID: cfg.ShardID, TotalShards: cfg.TotalShards,
-		SegmentSize: cfg.SegmentSize, Watermark: cfg.SegmentRefillWatermark, Store: st,
-	})
-	t.Cleanup(alloc.Close)
-	return New(cfg, st, fg, alloc, codec), codec
+	srv := New(cfg, l, fg, codec)
+	t.Cleanup(srv.Close)
+	return srv, codec
 }
 
 func get(t *testing.T, ts *harness, path string) (int, map[string]any) {
@@ -284,8 +290,9 @@ func TestVector_everyType_uniqueAndContiguous(t *testing.T) {
 					t.Fatalf("%s[%d]=%s, want %s", dt, i, got, want)
 				}
 			case dt.IsUUID():
-				// A uuid is the shard's i-th counter value, scrambled: it decodes back to it.
-				got, err := ts.codec.Decode(s, dt.UUIDLength(), uuidgen.TweakFor(entity))
+				// A uuid is the shard's i-th counter value, scrambled: it decodes back to it, with
+				// the tenant's scramble (the pre-tenant roads act on legacy_tenant btcl).
+				got, err := ts.codec.Decode(s, dt.UUIDLength(), uuidgen.TweakForTenant("btcl", entity))
 				if want := layout.k + int64(i)*layout.n; err != nil || got != want {
 					t.Fatalf("%s[%d]=%q decodes to %d (%v), want %d", dt, i, s, got, err, want)
 				}

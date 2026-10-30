@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/telcobright/bucket-next/internal/allocator"
@@ -34,9 +33,33 @@ func writeError(w http.ResponseWriter, status int, errCode, message string) {
 	writeJSON(w, status, out)
 }
 
-// extractEntity strips the prefix from r.URL.Path. Returns empty if missing.
-func extractEntity(r *http.Request, prefix string) string {
-	return strings.TrimPrefix(r.URL.Path, prefix)
+// road is one API road: it answers c for its path's last part (the entity, or the
+// Snowflake id; empty for list and types).
+type road func(c *call, arg string)
+
+// call is one request, on the tenant it acts on.
+type call struct {
+	w  http.ResponseWriter
+	r  *http.Request
+	t  *tenant
+	v2 bool // a tenant-first road: every answer names its tenant
+}
+
+// reply writes body; a tenant-first road's answers, refusals too, name the tenant.
+func (c *call) reply(status int, body map[string]any) {
+	if c.v2 {
+		body["tenant"] = c.t.name
+	}
+	writeJSON(c.w, status, body)
+}
+
+// refuse writes {"error": word, "message": message}. The word is the contract.
+func (c *call) refuse(status int, word, message string) {
+	body := map[string]any{"error": word}
+	if message != "" {
+		body["message"] = message
+	}
+	c.reply(status, body)
 }
 
 // formatNumeric returns the on-wire form for an int/long value: long is a decimal string so
@@ -56,29 +79,39 @@ type rangeInfo struct {
 	Count int   `json:"count"`
 }
 
-// registerOrCheck auto-registers the entity with dt, or answers 400 if it is bound to
-// another type. Returns false when it has written a response.
-func (s *Server) registerOrCheck(w http.ResponseWriter, name string, dt datatype.DataType) bool {
-	rec, _, err := s.state.Register(name, dt, 0)
+// registerOrCheck auto-registers the entity with dt in the call's tenant, or answers 400 if
+// it is bound to another type. ok=false: it has written the answer.
+func (s *Server) registerOrCheck(c *call, name string, dt datatype.DataType) (state.Record, bool) {
+	rec, _, err := c.t.store.Register(name, dt, 0)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to register entity", err.Error())
-		return false
+		c.refuse(http.StatusInternalServerError, "Failed to register entity", err.Error())
+		return rec, false
 	}
 	if rec.DataType != dt {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
+		c.reply(http.StatusBadRequest, map[string]any{
 			"error":          "Type mismatch",
 			"message":        fmt.Sprintf("Entity '%s' is registered as '%s', cannot use '%s'", name, rec.DataType, dt),
 			"registeredType": rec.DataType,
 		})
-		return false
+		return rec, false
 	}
-	return true
+	return rec, true
 }
 
-// mint produces n new IDs for the entity in wire form. It is the one code path behind both
-// the scalar (n=1) and the vector API, for every type. For int/long it also returns the
-// vector as a range: the n values are consecutive on this shard.
-func (s *Server) mint(name string, dt datatype.DataType, n int) ([]any, *rangeInfo, error) {
+// tweakOf is the scramble a uuid record was registered with: the tenant's, or the entity
+// name's alone for a record carried over from a pre-tenant file.
+func tweakOf(tenant string, rec state.Record) uuidgen.Tweak {
+	if rec.UUIDTweak == state.TweakEntity {
+		return uuidgen.TweakFor(rec.EntityName)
+	}
+	return uuidgen.TweakForTenant(tenant, rec.EntityName)
+}
+
+// mint produces n new IDs for the tenant's entity in wire form. It is the one code path
+// behind both the scalar (n=1) and the vector API, for every type. For int/long it also
+// returns the vector as a range: the n values are consecutive on this shard.
+func (s *Server) mint(t *tenant, rec state.Record, n int) ([]any, *rangeInfo, error) {
+	name, dt := rec.EntityName, rec.DataType
 	values := make([]any, n)
 	if dt == datatype.Snowflake {
 		ids, err := s.forge.GenerateBatch(n)
@@ -90,12 +123,12 @@ func (s *Server) mint(name string, dt datatype.DataType, n int) ([]any, *rangeIn
 		}
 		return values, nil, nil
 	}
-	first, err := s.allocator.Next(name, dt, int64(n))
+	first, err := t.alloc.Next(name, dt, int64(n))
 	if err != nil {
 		return nil, nil, err
 	}
-	layout := s.allocator.Layout()
-	tweak := uuidgen.TweakFor(name)
+	layout := s.layout
+	tweak := tweakOf(t.name, rec)
 	for i := 0; i < n; i++ {
 		v := layout.Value(first + int64(i))
 		if dt.IsUUID() {
@@ -114,34 +147,34 @@ func (s *Server) mint(name string, dt datatype.DataType, n int) ([]any, *rangeIn
 	return values, &rangeInfo{First: values[0], Last: values[n-1], Step: layout.TotalShards, Count: n}, nil
 }
 
-func writeMintError(w http.ResponseWriter, name string, dt datatype.DataType, err error) {
+func writeMintError(c *call, name string, dt datatype.DataType, err error) {
 	if errors.Is(err, allocator.ErrExhausted) {
-		writeError(w, http.StatusConflict, "Range exhausted",
+		c.refuse(http.StatusConflict, "Range exhausted",
 			fmt.Sprintf("Entity '%s' has no %s values left on this shard (max %d)", name, dt, dt.MaxValue()))
 		return
 	}
-	writeError(w, http.StatusInternalServerError, "Generation failed", err.Error())
+	c.refuse(http.StatusInternalServerError, "Generation failed", err.Error())
 }
 
 // parseCounterValue validates a user-supplied value for an int/long entity and snaps it to
 // this shard. It returns the snapped value, or writes a 400 and returns ok=false.
-func (s *Server) parseCounterValue(w http.ResponseWriter, dt datatype.DataType, v int64, field string) (int64, bool) {
+func (s *Server) parseCounterValue(c *call, dt datatype.DataType, v int64, field string) (int64, bool) {
 	max := dt.MaxValue()
 	if v < 1 || v > max {
-		writeError(w, http.StatusBadRequest, "Invalid "+field,
+		c.refuse(http.StatusBadRequest, "Invalid "+field,
 			fmt.Sprintf("%s must be between 1 and %d for type %s", field, max, dt))
 		return 0, false
 	}
-	snapped := s.allocator.Layout().SnapForward(v)
+	snapped := s.layout.SnapForward(v)
 	if snapped < v || snapped > max {
-		writeError(w, http.StatusBadRequest, "Invalid "+field,
+		c.refuse(http.StatusBadRequest, "Invalid "+field,
 			fmt.Sprintf("%s %d has no value for shard %d at or below %d", field, v, s.cfg.ShardID, max))
 		return 0, false
 	}
 	return snapped, true
 }
 
-// ---------- health / introspection ----------
+// ---------- health / introspection (global: no tenant) ----------
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	gen, col, wait := s.forge.Stats()
@@ -150,6 +183,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"uptime":      time.Since(s.startedAt).Seconds(),
 		"shard":       s.cfg.ShardID,
 		"totalShards": s.cfg.TotalShards,
+		"tenants":     s.served,
 		"snowflakeStats": map[string]any{
 			"generated":   gen,
 			"collisions":  col,
@@ -163,18 +197,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleShardInfo also reports the values every shard of a cluster must share, so an
-// operator can compare them across nodes.
+// operator can compare them across nodes: the uuid key's fingerprint, the Snowflake epoch
+// and the served tenants.
 func (s *Server) handleShardInfo(w http.ResponseWriter, r *http.Request) {
+	var legacy any
+	if s.legacy != nil {
+		legacy = s.legacy.name
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"shardId":            s.cfg.ShardID,
 		"totalShards":        s.cfg.TotalShards,
 		"status":             "active",
 		"uuidKeyFingerprint": s.codec.Fingerprint(),
 		"snowflakeEpochMs":   s.cfg.SnowflakeEpochMs,
+		"tenants":            s.served,
+		"legacyTenant":       legacy,
 	})
 }
 
-func (s *Server) handleTypes(w http.ResponseWriter, r *http.Request) {
+func (s *Server) types(c *call, _ string) {
 	k, N := s.cfg.ShardID, s.cfg.TotalShards
 	uuidDesc := func(n int) string {
 		return fmt.Sprintf("Unique %d-character alphanumeric string (shard-interleaved counter, keyed scramble)", n)
@@ -192,13 +233,20 @@ func (s *Server) handleTypes(w http.ResponseWriter, r *http.Request) {
 	for i, t := range datatype.All {
 		types[i] = string(t)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	versions := map[string]string{
+		"scalar": "GET /api/next-id/{entity}?dataType=T — one ID",
+		"vector": fmt.Sprintf("GET /api/next-batch/{entity}?dataType=T&batchSize=N — N IDs (1..%d)", MaxBatchSize),
+	}
+	if c.v2 {
+		versions = map[string]string{
+			"scalar": "GET /api/v2/{tenant}/next-id/{entity}?dataType=T — one ID",
+			"vector": fmt.Sprintf("GET /api/v2/{tenant}/next-batch/{entity}?dataType=T&batchSize=N — N IDs (1..%d)", MaxBatchSize),
+		}
+	}
+	c.reply(http.StatusOK, map[string]any{
 		"availableTypes": types,
 		"description":    desc,
-		"apiVersions": map[string]string{
-			"scalar": "GET /api/next-id/{entity}?dataType=T — one ID",
-			"vector": fmt.Sprintf("GET /api/next-batch/{entity}?dataType=T&batchSize=N — N IDs (1..%d)", MaxBatchSize),
-		},
+		"apiVersions":    versions,
 		"shardInfo": map[string]any{
 			"shardId":     s.cfg.ShardID,
 			"totalShards": s.cfg.TotalShards,
@@ -209,27 +257,27 @@ func (s *Server) handleTypes(w http.ResponseWriter, r *http.Request) {
 
 // ---------- ID generation: scalar + vector ----------
 
-// handleNextID is the scalar version: one new ID.
-func (s *Server) handleNextID(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/next-id/")
+// nextID is the scalar version: one new ID.
+func (s *Server) nextID(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
-	dt, err := datatype.Parse(r.URL.Query().Get("dataType"))
+	dt, err := datatype.Parse(c.r.URL.Query().Get("dataType"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "Valid dataType is required", err.Error())
+		c.refuse(http.StatusBadRequest, "Valid dataType is required", err.Error())
 		return
 	}
-	if !s.registerOrCheck(w, name, dt) {
+	rec, ok := s.registerOrCheck(c, name, dt)
+	if !ok {
 		return
 	}
-	values, _, err := s.mint(name, dt, 1)
+	values, _, err := s.mint(c.t, rec, 1)
 	if err != nil {
-		writeMintError(w, name, dt, err)
+		writeMintError(c, name, dt, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	c.reply(http.StatusOK, map[string]any{
 		"entityName": name,
 		"dataType":   string(dt),
 		"value":      values[0],
@@ -237,30 +285,30 @@ func (s *Server) handleNextID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleNextBatch is the vector version: a range of new IDs.
-func (s *Server) handleNextBatch(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/next-batch/")
+// nextBatch is the vector version: a range of new IDs.
+func (s *Server) nextBatch(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
-	dt, err := datatype.Parse(r.URL.Query().Get("dataType"))
+	dt, err := datatype.Parse(c.r.URL.Query().Get("dataType"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "Valid dataType is required", err.Error())
+		c.refuse(http.StatusBadRequest, "Valid dataType is required", err.Error())
 		return
 	}
-	bs, err := strconv.Atoi(r.URL.Query().Get("batchSize"))
+	bs, err := strconv.Atoi(c.r.URL.Query().Get("batchSize"))
 	if err != nil || bs < 1 || bs > MaxBatchSize {
-		writeError(w, http.StatusBadRequest, "Valid batchSize is required",
+		c.refuse(http.StatusBadRequest, "Valid batchSize is required",
 			fmt.Sprintf("batchSize must be in [1, %d]", MaxBatchSize))
 		return
 	}
-	if !s.registerOrCheck(w, name, dt) {
+	rec, ok := s.registerOrCheck(c, name, dt)
+	if !ok {
 		return
 	}
-	values, rng, err := s.mint(name, dt, bs)
+	values, rng, err := s.mint(c.t, rec, bs)
 	if err != nil {
-		writeMintError(w, name, dt, err)
+		writeMintError(c, name, dt, err)
 		return
 	}
 	resp := map[string]any{
@@ -275,37 +323,36 @@ func (s *Server) handleNextBatch(w http.ResponseWriter, r *http.Request) {
 	if rng != nil {
 		resp["range"] = rng
 	}
-	writeJSON(w, http.StatusOK, resp)
+	c.reply(http.StatusOK, resp)
 }
 
 // ---------- entity lifecycle ----------
 
-func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/init/")
+func (s *Server) initEntity(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
 	var body struct {
 		DataType   string `json:"dataType"`
 		StartValue *int64 `json:"startValue"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON body", err.Error())
+	if err := json.NewDecoder(c.r.Body).Decode(&body); err != nil {
+		c.refuse(http.StatusBadRequest, "Invalid JSON body", err.Error())
 		return
 	}
 	dt, err := datatype.Parse(body.DataType)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "Valid dataType is required", err.Error())
+		c.refuse(http.StatusBadRequest, "Valid dataType is required", err.Error())
 		return
 	}
 	if body.StartValue != nil && !dt.IsNumeric() {
-		writeError(w, http.StatusBadRequest, "Invalid start value",
+		c.refuse(http.StatusBadRequest, "Invalid start value",
 			fmt.Sprintf("startValue is only supported for int and long, not %s", dt))
 		return
 	}
 
-	layout := s.allocator.Layout()
+	layout := s.layout
 	var initialIter int64
 	resp := map[string]any{
 		"entityName":  name,
@@ -316,7 +363,7 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.StartValue != nil {
 		requested := *body.StartValue
-		snapped, ok := s.parseCounterValue(w, dt, requested, "startValue")
+		snapped, ok := s.parseCounterValue(c, dt, requested, "startValue")
 		if !ok {
 			return
 		}
@@ -329,13 +376,13 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rec, created, err := s.state.Register(name, dt, initialIter)
+	rec, created, err := c.t.store.Register(name, dt, initialIter)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to register entity", err.Error())
+		c.refuse(http.StatusInternalServerError, "Failed to register entity", err.Error())
 		return
 	}
 	if !created {
-		writeJSON(w, http.StatusConflict, map[string]any{
+		c.reply(http.StatusConflict, map[string]any{
 			"error":   "Entity already exists",
 			"message": fmt.Sprintf("Entity '%s' is already registered with type '%s'", name, rec.DataType),
 			"currentStatus": map[string]any{
@@ -350,51 +397,49 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 		resp["nextValue"] = formatNumeric(dt, layout.Value(initialIter))
 		resp["pattern"] = fmt.Sprintf("%d, %d, %d, ...", s.cfg.ShardID, s.cfg.ShardID+s.cfg.TotalShards, s.cfg.ShardID+2*s.cfg.TotalShards)
 	}
-	writeJSON(w, http.StatusCreated, resp)
+	c.reply(http.StatusCreated, resp)
 }
 
-// handleReset moves an int/long counter. Moving it below IDs that may already be issued is
+// reset moves an int/long counter. Moving it below IDs that may already be issued is
 // refused unless the body says "force": true.
-func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/reset/")
+func (s *Server) reset(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
 	var body struct {
 		Value *int64 `json:"value"`
 		Force bool   `json:"force"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON body", err.Error())
+	if err := json.NewDecoder(c.r.Body).Decode(&body); err != nil {
+		c.refuse(http.StatusBadRequest, "Invalid JSON body", err.Error())
 		return
 	}
 	if body.Value == nil {
-		writeError(w, http.StatusBadRequest, "value is required", "")
+		c.refuse(http.StatusBadRequest, "value is required", "")
 		return
 	}
-	rec, ok := s.state.Get(name)
+	rec, ok := c.t.store.Get(name)
 	if !ok {
-		writeError(w, http.StatusNotFound, "Entity not found",
-			fmt.Sprintf("Entity '%s' is not registered", name))
+		c.refuse(http.StatusNotFound, "Entity not found", fmt.Sprintf("Entity '%s' is not registered", name))
 		return
 	}
 	if !rec.DataType.IsNumeric() {
-		writeError(w, http.StatusBadRequest, "Invalid operation",
+		c.refuse(http.StatusBadRequest, "Invalid operation",
 			fmt.Sprintf("Cannot reset counter for type '%s'. Reset is only available for int and long.", rec.DataType))
 		return
 	}
 	dt := rec.DataType
 	requested := *body.Value
-	snapped, ok := s.parseCounterValue(w, dt, requested, "value")
+	snapped, ok := s.parseCounterValue(c, dt, requested, "value")
 	if !ok {
 		return
 	}
-	layout := s.allocator.Layout()
+	layout := s.layout
 	newIter := layout.Iter(snapped)
-	prevIter, err := s.allocator.Reset(name, newIter, body.Force)
+	prevIter, err := c.t.alloc.Reset(name, newIter, body.Force)
 	if errors.Is(err, allocator.ErrBackward) {
-		writeJSON(w, http.StatusConflict, map[string]any{
+		c.reply(http.StatusConflict, map[string]any{
 			"error": "Backward reset refused",
 			"message": fmt.Sprintf("Next value is %d; moving to %d could re-issue IDs that are already in use. "+
 				"Send \"force\": true to do it anyway.", layout.Value(prevIter), snapped),
@@ -403,7 +448,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to reset", err.Error())
+		c.refuse(http.StatusInternalServerError, "Failed to reset", err.Error())
 		return
 	}
 
@@ -426,13 +471,13 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 		resp["adjusted"] = true
 		resp["adjustmentReason"] = fmt.Sprintf("Value adjusted from %d to %d to match shard %d pattern", requested, snapped, s.cfg.ShardID)
 	}
-	writeJSON(w, http.StatusOK, resp)
+	c.reply(http.StatusOK, resp)
 }
 
 // entityView is the status/list shape. For int/long, currentValue is the last value this
 // process handed out and nextValue the one it will hand out next. uuid values are opaque,
 // so only the counter position is shown.
-func (s *Server) entityView(rec state.Record) map[string]any {
+func (s *Server) entityView(t *tenant, rec state.Record) map[string]any {
 	view := map[string]any{
 		"entityName":       rec.EntityName,
 		"dataType":         string(rec.DataType),
@@ -445,40 +490,38 @@ func (s *Server) entityView(rec state.Record) map[string]any {
 	case rec.DataType == datatype.Snowflake:
 		view["currentValue"] = "N/A (Snowflake IDs are not sequential)"
 	case rec.DataType.IsNumeric():
-		snap, err := s.allocator.Snapshot(rec.EntityName)
+		snap, err := t.alloc.Snapshot(rec.EntityName)
 		if err != nil {
 			return view
 		}
-		layout := s.allocator.Layout()
 		if snap.Loaded && snap.Issued > 0 {
-			view["currentValue"] = formatNumeric(rec.DataType, layout.Value(snap.NextIteration-1))
+			view["currentValue"] = formatNumeric(rec.DataType, s.layout.Value(snap.NextIteration-1))
 		}
-		view["nextValue"] = formatNumeric(rec.DataType, layout.Value(snap.NextIteration))
+		view["nextValue"] = formatNumeric(rec.DataType, s.layout.Value(snap.NextIteration))
 	}
 	return view
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/status/")
+func (s *Server) status(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
-	rec, ok := s.state.Get(name)
+	rec, ok := c.t.store.Get(name)
 	if !ok {
-		writeError(w, http.StatusNotFound, "Entity not found", "")
+		c.refuse(http.StatusNotFound, "Entity not found", "")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.entityView(rec))
+	c.reply(http.StatusOK, s.entityView(c.t, rec))
 }
 
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	records := s.state.All()
+func (s *Server) list(c *call, _ string) {
+	records := c.t.store.All()
 	entities := make([]map[string]any, 0, len(records))
 	for _, rec := range records {
-		entities = append(entities, s.entityView(rec))
+		entities = append(entities, s.entityView(c.t, rec))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	c.reply(http.StatusOK, map[string]any{
 		"entities": entities,
 		"shardInfo": map[string]any{
 			"shardId":     s.cfg.ShardID,
@@ -487,26 +530,25 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSegmentState shows the in-RAM reservation of a counter entity (int, long, uuid*).
-func (s *Server) handleSegmentState(w http.ResponseWriter, r *http.Request) {
-	name := extractEntity(r, "/api/segment-state/")
+// segmentState shows the in-RAM reservation of a counter entity (int, long, uuid*).
+func (s *Server) segmentState(c *call, name string) {
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "Entity name is required", "")
+		c.refuse(http.StatusBadRequest, "Entity name is required", "")
 		return
 	}
-	rec, ok := s.state.Get(name)
+	rec, ok := c.t.store.Get(name)
 	if !ok {
-		writeError(w, http.StatusNotFound, "Entity not found", "")
+		c.refuse(http.StatusNotFound, "Entity not found", "")
 		return
 	}
 	if !rec.DataType.IsCounter() {
-		writeError(w, http.StatusBadRequest, "Invalid type",
+		c.refuse(http.StatusBadRequest, "Invalid type",
 			fmt.Sprintf("Reservations exist only for counter types (int, long, uuid*); entity '%s' is '%s'", name, rec.DataType))
 		return
 	}
-	snap, err := s.allocator.Snapshot(name)
+	snap, err := c.t.alloc.Snapshot(name)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Snapshot failed", err.Error())
+		c.refuse(http.StatusInternalServerError, "Snapshot failed", err.Error())
 		return
 	}
 	seg := map[string]any{
@@ -521,11 +563,10 @@ func (s *Server) handleSegmentState(w http.ResponseWriter, r *http.Request) {
 		"diskMark":       snap.DiskMark,
 	}
 	if rec.DataType.IsNumeric() {
-		layout := s.allocator.Layout()
-		seg["nextValue"] = formatNumeric(rec.DataType, layout.Value(snap.NextIteration))
-		seg["diskHighWaterMark"] = formatNumeric(rec.DataType, layout.Value(snap.DiskMark))
+		seg["nextValue"] = formatNumeric(rec.DataType, s.layout.Value(snap.NextIteration))
+		seg["diskHighWaterMark"] = formatNumeric(rec.DataType, s.layout.Value(snap.DiskMark))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	c.reply(http.StatusOK, map[string]any{
 		"entityName": name,
 		"dataType":   string(rec.DataType),
 		"segment":    seg,
@@ -533,16 +574,28 @@ func (s *Server) handleSegmentState(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleParseSnowflake(w http.ResponseWriter, r *http.Request) {
-	idStr := extractEntity(r, "/api/parse-snowflake/")
-	if idStr == "" {
-		writeError(w, http.StatusBadRequest, "Snowflake id is required", "")
+// parseSnowflake decodes a Snowflake ID. It reads no tenant data: Snowflake IDs are unique
+// across the whole installation.
+func (s *Server) parseSnowflake(c *call, id string) {
+	if id == "" {
+		c.refuse(http.StatusBadRequest, "Snowflake id is required", "")
 		return
 	}
-	parsed, err := s.forge.Parse(idStr)
+	parsed, err := s.forge.Parse(id)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid Snowflake ID", err.Error())
+		c.refuse(http.StatusBadRequest, "Invalid Snowflake ID", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, parsed)
+	if !c.v2 {
+		writeJSON(c.w, http.StatusOK, parsed)
+		return
+	}
+	c.reply(http.StatusOK, map[string]any{
+		"id":        parsed.ID,
+		"timestamp": parsed.Timestamp,
+		"date":      parsed.Date,
+		"shardId":   parsed.ShardID,
+		"sequence":  parsed.Sequence,
+		"binary":    parsed.Binary,
+	})
 }

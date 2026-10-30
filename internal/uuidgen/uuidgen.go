@@ -70,9 +70,20 @@ func SupportedLength(length int) bool {
 // Tweak selects one entity's permutation. Build it once per entity with TweakFor.
 type Tweak [6]byte
 
-// TweakFor derives the tweak for an entity name.
+// TweakFor derives the tweak from an entity name alone: the scramble of a uuid entity
+// registered before tenancy. It is kept for those entities, so their strings never change.
 func TweakFor(entity string) Tweak {
 	sum := sha256.Sum256([]byte(entity))
+	var t Tweak
+	copy(t[:], sum[:6])
+	return t
+}
+
+// TweakForTenant derives the tweak from the tenant and the entity name, so two tenants'
+// streams for the same entity name are unrelated: one tenant cannot predict another's
+// strings from its own. Neither name can hold a 0 byte, so the encoding is unambiguous.
+func TweakForTenant(tenant, entity string) Tweak {
+	sum := sha256.Sum256([]byte(tenant + "\x00" + entity))
 	var t Tweak
 	copy(t[:], sum[:6])
 	return t

@@ -5,18 +5,34 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/telcobright/bucket-next/internal/names"
 )
 
 // Config is the full configuration loaded from a single YAML file at startup.
 type Config struct {
-	ShardID     int    `yaml:"shard_id"`
-	TotalShards int    `yaml:"total_shards"`
-	ListenPort  int    `yaml:"listen_port"`
-	StatePath   string `yaml:"state_path"`
+	ShardID     int `yaml:"shard_id"`
+	TotalShards int `yaml:"total_shards"`
+	ListenPort  int `yaml:"listen_port"`
+
+	// StateDir is this shard's state directory: shard.json and tenants/<tenant>.json.
+	StateDir string `yaml:"state_dir"`
+	// StatePath is the pre-tenant key (one state file per shard). It is refused, naming
+	// state_dir instead.
+	StatePath string `yaml:"state_path"`
+
+	// Tenants are the tenants this installation serves (tenant-master's tenant ids). Every
+	// /api/ call names one; a call for any other is refused. A call never creates a tenant.
+	Tenants []string `yaml:"tenants"`
+	// LegacyTenant switches the pre-tenant roads (/api/next-id/{entity} and the rest, no
+	// tenant in the path) on, acting on this tenant, and names the owner of a pre-tenant
+	// state.json's counters. Empty: those roads are refused, in words.
+	LegacyTenant string `yaml:"legacy_tenant"`
 
 	// ListenAddress is the IP the HTTP server binds. Empty (the default) means every
 	// interface. The API has no authentication, so a dev box should say 127.0.0.1 and a
@@ -84,8 +100,30 @@ func (c *Config) validate() error {
 		return fmt.Errorf("listen_address must be an IP address such as 127.0.0.1 or the host's private IP "+
 			"(empty = all interfaces), got %q", c.ListenAddress)
 	}
-	if c.StatePath == "" {
-		return fmt.Errorf("state_path is required")
+	if c.StatePath != "" {
+		return fmt.Errorf("state_path is replaced by state_dir: the shard's directory, which holds shard.json and "+
+			"tenants/<tenant>.json (a state.json found in it is carried over into legacy_tenant at the first start) — "+
+			"e.g. state_dir: %s", filepath.Dir(c.StatePath))
+	}
+	if c.StateDir == "" {
+		return fmt.Errorf("state_dir is required")
+	}
+	if len(c.Tenants) == 0 {
+		return fmt.Errorf("tenants is required: the tenants this installation serves, e.g. tenants: [btcl]")
+	}
+	seen := map[string]bool{}
+	for _, t := range c.Tenants {
+		if !names.ValidTenant(t) {
+			return fmt.Errorf("tenants: %q breaks the tenant rule %s (tenant-master's tenant id: lowercase letters "+
+				"and digits, a letter first, 2-16 characters)", t, names.TenantRule)
+		}
+		if seen[t] {
+			return fmt.Errorf("tenants: %q is listed twice", t)
+		}
+		seen[t] = true
+	}
+	if c.LegacyTenant != "" && !seen[c.LegacyTenant] {
+		return fmt.Errorf("legacy_tenant %q is not one of tenants %v", c.LegacyTenant, c.Tenants)
 	}
 	if c.SegmentSize < 1 {
 		return fmt.Errorf("segment_size must be >= 1, got %d", c.SegmentSize)

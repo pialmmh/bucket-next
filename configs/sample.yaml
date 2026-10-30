@@ -8,7 +8,17 @@ total_shards: 1        # cluster size, 1..1024 — identical on every node
 listen_address: ""     # IP to bind; "" = all interfaces. The API has no auth: use 127.0.0.1 on a
                        # dev box and the host's private IP on a server.
 listen_port: 7001      # HTTP port
-state_path: ./data/state.json   # this shard's own file; parent dir auto-created
+state_dir: ./data/shard-1   # this shard's own directory: shard.json + tenants/<tenant>.json
+
+# The tenants this installation serves (tenant-master's tenant ids: lowercase letters and digits,
+# a letter first, 2-16 characters). Every /api/v2/{tenant}/... call names one of them; a call never
+# creates a tenant. A new tenant = one more name here + a restart: its file is created then.
+tenants: [btcl]
+
+# Optional. The pre-tenant roads (/api/next-id/{entity} and the rest, no tenant in the path) act on
+# this tenant, and a pre-tenant state.json found in state_dir is carried over into it. Unset = those
+# roads answer 400 "Tenant is required". Remove it once every caller has moved to /api/v2/.
+#legacy_tenant: btcl
 
 # Optional — tuning knobs.
 segment_size: 1000     # IDs reserved per durable disk write (int/long/uuid* types)
