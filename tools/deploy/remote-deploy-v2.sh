@@ -3,7 +3,7 @@
 # remote-deploy-v2.sh — build & deploy bucket-next for ONE tenant profile (the routesphere convention).
 #
 #   tools/deploy/remote-deploy-v2.sh <tenant> <profile> --dry-run        the plan + the rendered configs; no ssh, no build
-#   tools/deploy/remote-deploy-v2.sh <tenant> <profile> --init-state     FIRST deploy of a shard: create its missing state file
+#   tools/deploy/remote-deploy-v2.sh <tenant> <profile> --init-state     FIRST deploy of a shard: create its missing state
 #   tools/deploy/remote-deploy-v2.sh <tenant> <profile>                  every deployed shard of the profile
 #   tools/deploy/remote-deploy-v2.sh <tenant> <profile> --shard N        one shard
 #   tools/deploy/remote-deploy-v2.sh <tenant> <profile> --skip-build     ship the binaries already in bin/
@@ -17,12 +17,17 @@
 #     default /home/mustafa/telcobright-projects/routesphere/routesphere-core/tools/ssh-automation/servers
 #     override: BUCKET_NEXT_SSH_INVENTORY=<path>
 #
-# Each shard runs as the systemd unit bucket-next@<shard_id> with its own config (/etc/bucket-next/shard-<id>.yaml) and its
-# own state file, so several shards can share a host. A state file is created ONLY by --init-state and only when it is
-# missing: after a shard has minted, its file is never initialised again (that would re-issue ids).
+# <tenant> here is the INSTALLATION (whose boxes; the routesphere convention). The tenants the service SERVES are the
+# profile's own key: tenants: [btcl, ...] - one service per installation serves every tenant, the tenant a key on every call.
 #
-# Phases: 1 args · 2 validate · 3 tenant conf · 4 the service's config · 5 ssh · 6 plan · 7 build · 8 ship + install +
-# (first time) init-state + start · 9 health (/health, and /shard-info must report the shard we deployed).
+# Each shard runs as the systemd unit bucket-next@<shard_id> with its own config (/etc/bucket-next/shard-<id>.yaml) and its
+# own state directory (shard.json + tenants/<tenant>.json), so several shards can share a host. A shard's state is created
+# ONLY by --init-state and only when it has none: after a shard has minted, its state is never initialised again (that would
+# re-issue ids). A new tenant needs no --init-state: the shard creates its file at the next start.
+#
+# Phases: 1 args · 2 validate · 3 tenant conf · 4 the service's config · 5 ssh · 6 plan · 7 build · 8 ship + check (the new
+# binary reads the shard's state BEFORE anything is installed; a refusal leaves the running shard untouched) + install +
+# (first time) init-state + start · 9 health (/health, and /shard-info must report the shard and the tenants we deployed).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +38,8 @@ DEPS_DIR="$SCRIPT_DIR/dependencies"
 BIN_DIR="$PROJECT_DIR/bin"
 INVENTORY_DIR="${BUCKET_NEXT_SSH_INVENTORY:-/home/mustafa/telcobright-projects/routesphere/routesphere-core/tools/ssh-automation/servers}"
 # every key the service's profile YAML may state (shard_id and uuid_key are written by this script, never by the file)
-PROFILE_KEYS="total_shards listen_address listen_port state_path segment_size segment_refill_watermark clock_drift_tolerance_ms snowflake_epoch_ms"
+PROFILE_KEYS="total_shards listen_address listen_port state_dir tenants legacy_tenant segment_size segment_refill_watermark clock_drift_tolerance_ms snowflake_epoch_ms"
+TENANT_RE='[a-z][a-z0-9]{1,15}'   # tenant-master's tenant id: the service refuses any other spelling
 
 # ---------- 1 · args ----------
 
@@ -119,11 +125,13 @@ yaml_get() {
             print v; exit
         }' "$PROFILE_YML"
 }
+grep -qE '^[[:space:]]*-' "$PROFILE_YML" && die "$PROFILE_YML: write a list on one line, e.g. tenants: [btcl, other] (a block list is not read)"
 for k in $(awk '/^[ \t]*#/ || /^[ \t]*$/ { next } /^[A-Za-z_][A-Za-z0-9_]*[ \t]*:/ { sub(/[ \t]*:.*$/, ""); print; next } { print "?" $0 }' "$PROFILE_YML"); do
     case " $PROFILE_KEYS " in
         *" $k "*) ;;
         *) case "$k" in
                shard_id|uuid_key) die "$PROFILE_YML states $k: the deploy writes it per shard (the shard list is in the tenant conf; the uuid key comes from uuid_key_file)" ;;
+               state_path) die "$PROFILE_YML states state_path: it is replaced by state_dir (the shard's directory, e.g. /var/lib/bucket-next/shard-{shard_id}; a state.json in it is carried over into legacy_tenant)" ;;
                *) die "$PROFILE_YML: '$k' is not a key bucket-next reads (known: $PROFILE_KEYS)" ;;
            esac ;;
     esac
@@ -131,10 +139,22 @@ done
 TOTAL_SHARDS=$(yaml_get total_shards)
 LISTEN_ADDRESS=$(yaml_get listen_address)
 LISTEN_PORT=$(yaml_get listen_port)
-STATE_PATH_TMPL=$(yaml_get state_path)
+STATE_DIR_TMPL=$(yaml_get state_dir)
+SERVED_TENANTS_RAW=$(yaml_get tenants)
+LEGACY_TENANT=$(yaml_get legacy_tenant)
 [[ "$TOTAL_SHARDS" =~ ^[0-9]+$ ]] && [ "$TOTAL_SHARDS" -ge 1 ] && [ "$TOTAL_SHARDS" -le 1024 ] || die "$PROFILE_YML: total_shards must be 1..1024 (got '${TOTAL_SHARDS:-unset}')"
 : "${LISTEN_PORT:=7001}"
-: "${STATE_PATH_TMPL:=/var/lib/bucket-next/shard-{shard_id}/state.json}"
+: "${STATE_DIR_TMPL:=/var/lib/bucket-next/shard-{shard_id}}"
+# the tenants the service serves: one line, tenants: [a, b]; each tenant-master's tenant id; the list the same on every shard
+[[ "$SERVED_TENANTS_RAW" =~ ^\[[[:space:]]*${TENANT_RE}([[:space:]]*,[[:space:]]*${TENANT_RE})*[[:space:]]*\]$ ]] \
+    || die "$PROFILE_YML: tenants must be one line of tenant ids, e.g. tenants: [btcl] (got '${SERVED_TENANTS_RAW:-unset}'; a tenant id is ^${TENANT_RE}\$)"
+mapfile -t SERVED_TENANTS < <(echo "$SERVED_TENANTS_RAW" | tr -d '[] ' | tr ',' '\n')
+[ "$(printf '%s\n' "${SERVED_TENANTS[@]}" | sort | uniq -d)" = "" ] || die "$PROFILE_YML: a tenant is listed twice in tenants"
+if [ -n "$LEGACY_TENANT" ]; then
+    printf '%s\n' "${SERVED_TENANTS[@]}" | grep -qx "$LEGACY_TENANT" || die "$PROFILE_YML: legacy_tenant '$LEGACY_TENANT' is not one of tenants ${SERVED_TENANTS_RAW}"
+fi
+# what /shard-info must report: the served tenants, sorted, as JSON
+EXPECT_TENANTS_JSON="\"tenants\":[$(printf '%s\n' "${SERVED_TENANTS[@]}" | sort | sed 's/.*/"&"/' | paste -sd,)]"
 [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || die "$PROFILE_YML: listen_port must be a number"
 
 # the uuid key is the same on every shard; it lives in a file outside git, named by the tenant conf
@@ -178,19 +198,19 @@ for sid in "${SHARDS[@]}"; do
     [ -n "${S_HOST[$sid]}" ] && [ -n "${S_PORT[$sid]}" ] && [ -n "${S_USER[$sid]}" ] && [ -n "${S_KEY[$sid]}" ] \
         || die "shard $sid: $host_file lacks host/port/user/key"
     lport=$(parse_conf "shard${sid}.listen_port"); S_LPORT[$sid]="${lport:-$LISTEN_PORT}"
-    S_STATE[$sid]="${STATE_PATH_TMPL//\{shard_id\}/$sid}"
+    S_STATE[$sid]="${STATE_DIR_TMPL//\{shard_id\}/$sid}"
     addr="${LISTEN_ADDRESS//\{private_ip\}/$(parse_kv "$host_file" private_ip)}"
     [[ "$LISTEN_ADDRESS" != *"{private_ip}"* ]] || [ -n "$(parse_kv "$host_file" private_ip)" ] \
         || die "shard $sid: listen_address says {private_ip} and $host_file has no private_ip="
     [ -z "$addr" ] || [[ "$addr" =~ ^[0-9a-fA-F:.]+$ ]] || die "shard $sid: listen_address '$addr' is not an IP address"
     S_ADDR[$sid]="$addr"
 done
-# two shards on one host must not share a port or a state file: one would read the other's counters
+# two shards on one host must not share a port or a state directory: one would read the other's counters
 declare -A SEEN_PORT SEEN_STATE
 for sid in "${SHARDS[@]}"; do
     pk="${S_HOST[$sid]}:${S_LPORT[$sid]}"; sk="${S_HOST[$sid]}:${S_STATE[$sid]}"
     [ -z "${SEEN_PORT[$pk]:-}" ] || die "shards ${SEEN_PORT[$pk]} and $sid both listen on $pk - give one a shard<N>.listen_port in $CONFIG_FILE"
-    [ -z "${SEEN_STATE[$sk]:-}" ] || die "shards ${SEEN_STATE[$sk]} and $sid share the state file ${S_STATE[$sid]} on ${S_HOST[$sid]} - put {shard_id} in state_path"
+    [ -z "${SEEN_STATE[$sk]:-}" ] || die "shards ${SEEN_STATE[$sk]} and $sid share the state directory ${S_STATE[$sid]} on ${S_HOST[$sid]} - put {shard_id} in state_dir"
     SEEN_PORT[$pk]=$sid; SEEN_STATE[$sk]=$sid
 done
 if [ -n "$ONLY_SHARD" ]; then
@@ -209,9 +229,11 @@ Config (what):  ${PROFILE_YML#"$PROJECT_DIR"/}
 Conf (where):   ${CONFIG_FILE#"$PROJECT_DIR"/}   inventory $INVENTORY_DIR/$INVENTORY_TENANT
 Cluster:        total_shards=$TOTAL_SHARDS   deployed here: ${SHARDS[*]}$( [ "${#NOT_DEPLOYED[@]}" -gt 0 ] && echo "   DECLARED, NOT DEPLOYED: ${NOT_DEPLOYED[*]}" )
 Bind:           $( [ -n "$LISTEN_ADDRESS" ] && echo "listen_address=$LISTEN_ADDRESS" || echo "ALL interfaces (set listen_address: the API has no authentication)" )
+Serves tenants: ${SERVED_TENANTS[*]}   (every call /api/v2/{tenant}/...)
+Pre-tenant API: $( [ -n "$LEGACY_TENANT" ] && echo "ON, acting on legacy_tenant $LEGACY_TENANT (remove legacy_tenant once every caller is on /api/v2/)" || echo "OFF - /api/next-id/... without a tenant answers 400 \"Tenant is required\"" )
 uuid key:       $( [ -n "$UUID_KEY" ] && echo "from $UUID_KEY_FILE" || echo "not set - the built-in key (unique, but predictable)" )
 Build:          $( [ "$DRY_RUN" = true ] && echo "no (dry run)" || { [ "$SKIP_BUILD" = true ] && echo "SKIPPED" || echo "yes (GOOS=linux GOARCH=amd64, static)"; } )
-Init state:     $( [ "$INIT_STATE" = 1 ] && echo "yes - create a state file where a shard has none" || echo "no - a shard without a state file fails the deploy" )
+Init state:     $( [ "$INIT_STATE" = 1 ] && echo "yes - create the state where a shard has none" || echo "no - a shard without state fails the deploy" )
 Dry-run:        $DRY_RUN
 
 EOF
@@ -232,8 +254,10 @@ shard_id: $sid
 total_shards: $TOTAL_SHARDS
 listen_address: "${S_ADDR[$sid]}"
 listen_port: ${S_LPORT[$sid]}
-state_path: ${S_STATE[$sid]}
+state_dir: ${S_STATE[$sid]}
+tenants: $SERVED_TENANTS_RAW
 EOF
+    [ -z "$LEGACY_TENANT" ] || echo "legacy_tenant: $LEGACY_TENANT"
     for k in segment_size segment_refill_watermark clock_drift_tolerance_ms snowflake_epoch_ms; do
         v=$(yaml_get "$k"); [ -z "$v" ] || echo "$k: $v"
     done
@@ -313,10 +337,11 @@ deploy_one_shard() {
     local health info
     health=$(ssh -o ControlPath="$ctrl" "$server_addr" "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://$probe:$lport/health" || true)
     info=$(ssh -o ControlPath="$ctrl" "$server_addr" "curl -s --max-time 5 http://$probe:$lport/shard-info" || true)
-    if [ "$health" = 200 ] && echo "$info" | grep -q "\"shardId\":$sid," && echo "$info" | grep -q "\"totalShards\":$TOTAL_SHARDS,"; then
+    if [ "$health" = 200 ] && echo "$info" | grep -q "\"shardId\":$sid," && echo "$info" | grep -q "\"totalShards\":$TOTAL_SHARDS," \
+        && echo "$info" | grep -qF "$EXPECT_TENANTS_JSON"; then
         echo "  [shard $sid] OK - /health 200; /shard-info $info"
     else
-        echo "  [shard $sid] ERROR - /health ${health:-no answer}; /shard-info ${info:-<no answer>}"; return 1
+        echo "  [shard $sid] ERROR - /health ${health:-no answer}; /shard-info ${info:-<no answer>} (want shard $sid of $TOTAL_SHARDS, $EXPECT_TENANTS_JSON)"; return 1
     fi
 }
 

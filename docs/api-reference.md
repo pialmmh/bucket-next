@@ -1,300 +1,337 @@
 # API reference
 
-All endpoints speak JSON. **No authentication** — bind the service to loopback or a private IP
-with `listen_address` (see [configuration.md](configuration.md#listen_address--keep-the-api-private)).
-Base URL is `http://<listen_address>:<listen_port>` (default port `7001`). Examples below are real
-responses from shard 2 of 3.
+Base URL `http://<listen_address>:<listen_port>` (default port `7001`). JSON everywhere. **No
+authentication** — bind it to loopback or a private IP with `listen_address` (anyone who can reach
+the port can mint IDs and reset counters). Examples are real responses from shard 2 of 3 serving `btcl` and `acme`.
 
-## Conventions
+**Everything under `/api/` names its tenant, first:** `/api/v2/{tenant}/{road}[/{entity or id}]`. Only the two probes
+outside `/api/` are global.
 
-- **Two versions for every ID type** — *scalar* `next-id` returns one ID; *vector*
-  `next-batch` returns a range of 1–10 000 IDs. Both use the same counter, so they never overlap.
-- **`long` values are decimal strings**, not JSON numbers (JSON loses precision above 2^53).
-  `int` values are JSON numbers.
-- **Errors** look like `{"error": "<short code>", "message": "<detail>"}`.
-  - `400` — bad input (unknown type, bad batch size, type mismatch, value out of range)
-  - `404` — unknown entity
-  - `409` — a state conflict: range exhausted, entity already exists, backward reset refused
-  - `500` — server fault (e.g. the state file could not be written)
-- **Data types**: `int`, `long`, `snowflake`, `uuid8`, `uuid12`, `uuid16`, `uuid22`.
-
-## Endpoint index
+## Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/next-id/{entity}` | **Scalar** — mint one ID |
-| GET | `/api/next-batch/{entity}` | **Vector** — mint a range of up to 10 000 IDs |
-| POST | `/api/init/{entity}` | Register an entity, optionally with a start value |
-| PUT | `/api/reset/{entity}` | Move an `int`/`long` counter |
-| GET | `/api/status/{entity}` | One entity's snapshot |
-| GET | `/api/list` | Every entity on this shard |
-| GET | `/api/segment-state/{entity}` | RAM reservation of a counter entity |
-| GET | `/api/parse-snowflake/{id}` | Decode a Snowflake ID |
-| GET | `/health` | Liveness + Snowflake stats |
-| GET | `/shard-info` | Shard identity + values every shard must share |
-| GET | `/api/types` | Supported types and API versions |
+| GET | [`/api/v2/{tenant}/next-id/{entity}`](#get-apiv2tenantnext-identity--scalar) | **Scalar** — mint one ID |
+| GET | [`/api/v2/{tenant}/next-batch/{entity}`](#get-apiv2tenantnext-batchentity--vector) | **Vector** — mint up to 10 000 IDs |
+| POST | [`/api/v2/{tenant}/init/{entity}`](#post-apiv2tenantinitentity) | Register an entity, optional start value |
+| PUT | [`/api/v2/{tenant}/reset/{entity}`](#put-apiv2tenantresetentity) | Move an `int`/`long` counter |
+| GET | [`/api/v2/{tenant}/status/{entity}`](#get-apiv2tenantstatusentity) | One entity's snapshot |
+| GET | [`/api/v2/{tenant}/list`](#get-apiv2tenantlist) | Every entity of the tenant on this shard |
+| GET | [`/api/v2/{tenant}/segment-state/{entity}`](#get-apiv2tenantsegment-stateentity) | RAM reservation of a counter entity |
+| GET | [`/api/v2/{tenant}/parse-snowflake/{id}`](#get-apiv2tenantparse-snowflakeid) | Decode a Snowflake ID |
+| GET | [`/api/v2/{tenant}/types`](#get-apiv2tenanttypes) | Types and API versions |
+| GET | [`/health`](#get-health) | Liveness + Snowflake stats (global) |
+| GET | [`/shard-info`](#get-shard-info) | Shard identity, served tenants, cluster-wide values (global) |
 
-## Data types at a glance
+`types` and `parse-snowflake` read no tenant data, but they take the tenant too, so the rule has no exceptions and a
+caller's wrong tenant shows on its first call, whatever the call. The pre-tenant roads (`/api/next-id/{entity}` …,
+no tenant) are kept by one config line during the move: [Pre-tenant roads](#pre-tenant-roads).
 
-| Type | Wire form | Capacity per entity (cluster-wide) | How it's made |
-|---|---|---|---|
-| `int` | JSON number | up to 2 147 483 647 | shard-interleaved counter |
-| `long` | decimal string | up to 9.2 × 10^18 | shard-interleaved counter |
-| `snowflake` | decimal string | ~69 years from the epoch, 4096/ms/shard | 41-bit time + 10-bit shard + 12-bit sequence |
-| `uuid8` | 8 chars `[0-9a-zA-Z]` | 218 trillion | counter, scrambled by a keyed permutation |
-| `uuid12`/`uuid16`/`uuid22` | 12/16/22 chars | 9.2 × 10^18 | counter, scrambled by a keyed permutation |
+## Errors
 
-`uuid*` strings are fixed-length and look random, but they are **guaranteed unique per
-entity** — they are the entity's counter run through a bijection keyed by `uuid_key` and the
-entity name.
+Every error body is `{"error": "<word>", "message": "<detail>"}`; once the tenant is known it also names it
+(`"tenant": "btcl"`). **The word is the contract** — match the word, not the status alone.
+
+| Status | When | `error` |
+|---|---|---|
+| 400 | no tenant segment (`/api/v2/next-id/x`), or a pre-tenant road while they are switched off | `Tenant is required` |
+| 400 | the tenant breaks `^[a-z][a-z0-9]{1,15}$` (`BTCL`, `bt_cl`, `b`) | `Invalid tenant` |
+| 400 | a well-formed tenant this installation does not serve | `Unknown tenant` |
+| 400 | the entity breaks `^[A-Za-z0-9._-]{1,64}$` | `Invalid entity name` |
+| 400 | no entity in the path | `Entity name is required` |
+| 400 | unknown/missing `dataType` | `Valid dataType is required` |
+| 400 | `batchSize` missing or outside 1..10000 | `Valid batchSize is required` |
+| 400 | entity bound to another type (body adds `registeredType`) | `Type mismatch` |
+| 400 | start/reset value `< 1`, too large, or not allowed for the type | `Invalid startValue` / `Invalid value` / `Invalid start value` |
+| 400 | `reset` without `value` · on a non-counter · `segment-state` of a snowflake | `value is required` · `Invalid operation` · `Invalid type` |
+| 400 | a bad Snowflake id | `Invalid Snowflake ID` |
+| 404 | entity not registered in this tenant (`status`, `reset`, `segment-state`) | `Entity not found` |
+| 404 | no such road under `/api/v2/{tenant}/` | `Not found` |
+| 405 | wrong method (the `Allow` header names the right one) | `Method not allowed` |
+| 409 | the type has no values left for this entity on this shard | `Range exhausted` |
+| 409 | `init` on an existing entity | `Entity already exists` |
+| 409 | `reset` would move backward without `force` | `Backward reset refused` |
+| 500 | server fault, e.g. the state file could not be written | `Generation failed` / `Failed to …` |
+
+**Every tenant refusal is 400, never 404, on purpose:** 404 means "Entity not found", and a client that registers an
+entity when `status` answers 404 (seed-idgen's `mintAbove` does) must never take an unknown tenant for an unregistered
+entity.
+
+```json
+{"error":"Tenant is required","message":"the tenant comes first: /api/v2/{tenant}/next-id/{entity} (served tenants: acme, btcl)"}
+{"error":"Invalid tenant","message":"tenant 'BTCL' breaks the rule ^[a-z][a-z0-9]{1,15}$ (tenant-master's tenant id: lowercase letters and digits, a letter first, 2-16 characters; never case-folded)"}
+{"error":"Unknown tenant","message":"tenant 'nobody' is not served by this installation (served tenants: acme, btcl)"}
+{"error":"Invalid entity name","message":"entity 'a b' breaks the rule ^[A-Za-z0-9._-]{1,64}$ (letters, digits, '.', '_', '-'; 1-64 characters)","tenant":"btcl"}
+{"error":"Entity not found","tenant":"btcl"}
+```
 
 ---
 
-## GET /api/next-id/{entity} — scalar
+## GET /api/v2/{tenant}/next-id/{entity} — scalar
 
-Mint one ID. **Auto-registers** the entity with the requested type on its first call.
+Mint **one** ID. The entity registers itself in the tenant on its first call.
 
 | Param | In | Notes |
 |---|---|---|
-| `entity` | path | Any non-empty string. |
-| `dataType` | query | Required. One of the 7 types. |
+| `tenant` | path | one of the installation's tenants |
+| `entity` | path | `^[A-Za-z0-9._-]{1,64}$` |
+| `dataType` | query | required — one of the 7 types |
 
 ```bash
-curl "http://localhost:7001/api/next-id/order?dataType=int"
+curl "http://localhost:7001/api/v2/btcl/next-id/order?dataType=int"
 ```
 ```json
-{"dataType":"int","entityName":"order","shard":2,"value":2}
-```
-```bash
-curl "http://localhost:7001/api/next-id/session?dataType=uuid16"
-```
-```json
-{"dataType":"uuid16","entityName":"session","shard":2,"value":"oKs4845oCMOV3Qhm"}
+{"dataType":"int","entityName":"order","shard":2,"tenant":"btcl","value":2}
 ```
 
-**Errors**
-- `400` `Valid dataType is required` — missing or unknown `dataType`.
-- `400` `Type mismatch` — entity is bound to another type:
-  ```json
-  {"error":"Type mismatch","message":"Entity 'order' is registered as 'int', cannot use 'long'","registeredType":"int"}
-  ```
-- `409` `Range exhausted` — the entity's type has no values left on this shard:
-  ```json
-  {"error":"Range exhausted","message":"Entity 'x' has no int values left on this shard (max 2147483647)"}
-  ```
+```bash
+curl "http://localhost:7001/api/v2/btcl/next-id/token?dataType=uuid12"
+```
+```json
+{"dataType":"uuid12","entityName":"token","shard":2,"tenant":"btcl","value":"x24M8NOk49QE"}
+```
+
+The same entity in another tenant is another counter:
+```bash
+curl "http://localhost:7001/api/v2/acme/next-id/order?dataType=int"
+```
+```json
+{"dataType":"int","entityName":"order","shard":2,"tenant":"acme","value":2}
+```
+
+Type mismatch:
+```json
+{"error":"Type mismatch","message":"Entity 'order' is registered as 'int', cannot use 'long'","registeredType":"int","tenant":"btcl"}
+```
+
+Exhausted (e.g. an `int` entity past 2 147 483 647):
+```json
+{"error":"Range exhausted","message":"Entity 'x' has no int values left on this shard (max 2147483647)","tenant":"btcl"}
+```
 
 ---
 
-## GET /api/next-batch/{entity} — vector
+## GET /api/v2/{tenant}/next-batch/{entity} — vector
 
-Mint a range of IDs in one round trip. The high-TPS path.
+Mint a **range** of IDs in one round trip — the high-TPS path. It uses the same counter as
+`next-id`, so the two never overlap.
 
 | Param | In | Notes |
 |---|---|---|
-| `entity` | path | Any non-empty string. |
-| `dataType` | query | Required. |
-| `batchSize` | query | Required. Integer `1..10000`. |
+| `tenant`, `entity` | path | as for `next-id` |
+| `dataType` | query | required |
+| `batchSize` | query | required, `1..10000` |
 
 ```bash
-curl "http://localhost:7001/api/next-batch/cdr?dataType=long&batchSize=4"
+curl "http://localhost:7001/api/v2/btcl/next-batch/sms?dataType=long&batchSize=5"
 ```
 ```json
-{"batchSize":4,"dataType":"long","entityName":"cdr","shard":2,
- "startValue":"2","endValue":"11","values":["2","5","8","11"],
- "range":{"first":"2","last":"11","step":3,"count":4}}
+{"batchSize":5,"dataType":"long","endValue":"14","entityName":"sms",
+ "range":{"first":"2","last":"14","step":3,"count":5},
+ "shard":2,"startValue":"2","tenant":"btcl","values":["2","5","8","11","14"]}
 ```
 
-For `int` and `long` the batch is one contiguous slice of this shard's sequence, so `range`
-describes it completely: value *i* is `first + i × step` (`step` = `total_shards`).
+For `int` and `long` the batch is one contiguous slice of this shard's sequence, and `range`
+describes it fully: value *i* = `first + i × step` (`step` = `total_shards`).
 
 ```bash
-curl "http://localhost:7001/api/next-batch/token?dataType=uuid8&batchSize=3"
+curl "http://localhost:7001/api/v2/btcl/next-batch/session?dataType=uuid16&batchSize=3"
 ```
 ```json
-{"batchSize":3,"dataType":"uuid8","entityName":"token","shard":2,
- "startValue":"0CIOE46z","endValue":"LrdDXHX4","values":["0CIOE46z","gvV6EFAx","LrdDXHX4"]}
+{"batchSize":3,"dataType":"uuid16","endValue":"36f9gl3kSkMFRVjv","entityName":"session","shard":2,
+ "startValue":"HNNP8mpF5JLzEljJ","tenant":"btcl","values":["HNNP8mpF5JLzEljJ","0BBfDAXuQOgF3YMu","36f9gl3kSkMFRVjv"]}
 ```
 
-`snowflake` and `uuid*` batches carry `values` only (no `range`).
-
-**Errors** — as for `next-id`, plus `400` `Valid batchSize is required` for a missing,
-non-numeric, `< 1` or `> 10000` size. On `409` no IDs are handed out (no partial batch).
+`snowflake` and `uuid*` batches have `values` but no `range`. On `409` nothing is handed out —
+there are no partial batches.
 
 ---
 
-## POST /api/init/{entity}
+## POST /api/v2/{tenant}/init/{entity}
 
-Register an entity before any traffic, optionally choosing where an `int`/`long` counter
-starts. Refuses if the entity exists.
+Register an entity before traffic, optionally choosing where an `int`/`long` counter starts.
 
-**Counters are per shard.** `init`, `reset` and `status` act only on the shard you call. To put an
-entity's counter above IDs that already exist, do it on **every** shard that mints for that entity
-(each one snaps the value to its own residue).
-
-Body (`application/json`):
-
-| Field | Notes |
+| Body field | Notes |
 |---|---|
-| `dataType` | Required. |
-| `startValue` | Optional; `int`/`long` only; `1..max`. Snapped **forward** to this shard's residue. |
+| `dataType` | required |
+| `startValue` | optional; `int`/`long` only; `1..max`; snapped **forward** to this shard |
 
 ```bash
-curl -X POST http://localhost:7001/api/init/invoice \
-  -H 'Content-Type: application/json' -d '{"dataType":"long","startValue":1000}'
+curl -X POST http://localhost:7001/api/v2/btcl/init/invoice \
+  -H 'Content-Type: application/json' \
+  -d '{"dataType":"long","startValue":1000}'
 ```
 ```json
-{"entityName":"invoice","dataType":"long","shard":2,"initialized":true,
+{"actualStartValue":"1001","adjusted":true,"adjustmentReason":"Value adjusted to match shard 2 pattern",
+ "dataType":"long","entityName":"invoice","initialized":true,
  "message":"Entity 'invoice' initialized successfully with type 'long'",
- "requestedStartValue":1000,"actualStartValue":"1001",
- "adjusted":true,"adjustmentReason":"Value adjusted to match shard 2 pattern",
- "nextValue":"1001","pattern":"2, 5, 8, ..."}
+ "nextValue":"1001","pattern":"2, 5, 8, ...","requestedStartValue":1000,"shard":2,"tenant":"btcl"}
 ```
 
-**Errors**
-- `409` `Entity already exists` (body includes its `dataType` and `currentIteration`).
-- `400` `Invalid startValue` — `< 1`, above the type's maximum, no slot for this shard at or
-  below the maximum, or given for a non-numeric type:
-  ```json
-  {"error":"Invalid startValue","message":"startValue must be between 1 and 9223372036854775807 for type long"}
-  ```
+`1000 mod 3 = 1`, but shard 2 owns residue 2, so the start moves up to `1001`.
+
+Again → `409`:
+```json
+{"currentStatus":{"currentIteration":333,"dataType":"long","shard":2},"error":"Entity already exists",
+ "message":"Entity 'invoice' is already registered with type 'long'","tenant":"btcl"}
+```
+`400 Invalid startValue`:
+```json
+{"error":"Invalid startValue","message":"startValue must be between 1 and 9223372036854775807 for type long","tenant":"btcl"}
+```
 
 ---
 
-## PUT /api/reset/{entity}
+## PUT /api/v2/{tenant}/reset/{entity}
 
-Move an `int`/`long` counter. The value is snapped forward to this shard's residue. It takes
-effect immediately. Like `init`, it acts on this shard only — repeat it on every shard.
+Move an `int`/`long` counter. The value is snapped forward to this shard. Moving **backward**
+— below IDs that may already be in use — is refused unless `"force": true`.
 
-Moving the counter **backward** — below IDs that may already be in use — is refused unless
-you send `"force": true`, because it re-issues IDs.
-
-Body (`application/json`): `{ "value": <number>, "force": <bool, optional> }`
+| Body field | Notes |
+|---|---|
+| `value` | required, `1..max` |
+| `force` | optional, default `false` — allow a backward move |
 
 ```bash
-curl -X PUT http://localhost:7001/api/reset/order \
+curl -X PUT http://localhost:7001/api/v2/btcl/reset/invoice \
   -H 'Content-Type: application/json' -d '{"value":5000}'
 ```
 ```json
-{"entityName":"order","dataType":"int","shard":2,
- "reset":{"previousNextValue":14,"requestedValue":5000,"actualValue":5000,
-          "previousIteration":4,"newIteration":1666,"forced":false},
- "nextValue":5000,"message":"Counter reset successfully. Next value will be 5000"}
+{"dataType":"long","entityName":"invoice","message":"Counter reset successfully. Next value will be 5000","nextValue":"5000",
+ "reset":{"actualValue":"5000","forced":false,"newIteration":1666,"previousIteration":334,"previousNextValue":"1004","requestedValue":"5000"},
+ "shard":2,"tenant":"btcl"}
 ```
 
-Backward without `force`:
+Backward without `force` → `409`:
 ```json
-{"error":"Backward reset refused","message":"Next value is 14; moving to 2 could re-issue IDs that are already in use. Send \"force\": true to do it anyway.","nextValue":14}
+{"error":"Backward reset refused","message":"Next value is 5000; moving to 101 could re-issue IDs that are already in use. Send \"force\": true to do it anyway.","nextValue":"5000","tenant":"btcl"}
 ```
 
-Backward with `"force": true` succeeds and reports `"forced": true`.
-
-**Errors**
-- `404` — entity not registered (reset never creates one).
-- `400` — entity is not `int`/`long`, or `value` is missing, `< 1` or above the maximum.
-- `409` `Backward reset refused` — see above.
+With `{"value":100,"force":true}` it succeeds and reports `"forced":true`.
+Errors: `404` unknown entity, `400` not `int`/`long` or bad value, `409` as above.
 
 ---
 
-## GET /api/status/{entity}
+## GET /api/v2/{tenant}/status/{entity}
 
 ```bash
-curl http://localhost:7001/api/status/cdr
+curl http://localhost:7001/api/v2/btcl/status/cdr
 ```
 ```json
-{"entityName":"cdr","dataType":"long","currentIteration":1000,"currentValue":"11","nextValue":"14","shard":2}
+{"currentIteration":1000,"currentValue":"2","dataType":"long","entityName":"cdr","nextValue":"5","shard":2,"tenant":"btcl"}
 ```
 
-- `currentValue` — the last value this process handed out (`null` if none yet).
-- `nextValue` — the value it will hand out next.
-- `currentIteration` — the durable mark in the state file (it runs ahead of `nextValue`
-  because of reservations).
-- For `uuid*`, `currentValue` and `nextValue` are `null` (the strings are opaque). For
-  `snowflake`, `currentValue` reads `"N/A (Snowflake IDs are not sequential)"`.
+| Field | Meaning |
+|---|---|
+| `currentValue` | last value this process handed out (`null` if none yet) |
+| `nextValue` | value it will hand out next |
+| `currentIteration` | durable mark in the state file (runs ahead because of reservations) |
 
-**Errors**: `404` if the entity does not exist.
+For `uuid*` both values are `null` (opaque strings). For `snowflake`, `currentValue` is
+`"N/A (Snowflake IDs are not sequential)"`. `404 Entity not found` if the tenant has no such entity.
 
 ---
 
-## GET /api/list
+## GET /api/v2/{tenant}/list
 
-Every entity on this shard, each in the `status` shape, plus `shardInfo`.
+Every entity of the tenant on this shard, each in the `status` shape:
 
 ```json
-{"entities":[{"entityName":"cdr","dataType":"long","currentIteration":1000,"currentValue":"11","nextValue":"14","shard":2}, ...],
- "shardInfo":{"shardId":2,"totalShards":3}}
+{"entities":[{"currentIteration":1000,"currentValue":"2","dataType":"long","entityName":"cdr","nextValue":"5","shard":2},
+             {"currentIteration":1000,"currentValue":2,"dataType":"int","entityName":"order","nextValue":5,"shard":2}],
+ "shardInfo":{"shardId":2,"totalShards":3},"tenant":"btcl"}
 ```
 
-Per shard only. For a cluster view, call every shard and merge.
+Per tenant and per shard only — for a cluster view, call each shard and merge.
 
 ---
 
-## GET /api/segment-state/{entity}
+## GET /api/v2/{tenant}/segment-state/{entity}
 
-Diagnostic view of a counter entity's RAM reservation (`int`, `long`, `uuid*`). Not on the hot
-path.
+Diagnostic view of a counter entity's RAM reservation (`int`, `long`, `uuid*`).
 
 ```bash
-curl http://localhost:7001/api/segment-state/cdr
+curl http://localhost:7001/api/v2/btcl/segment-state/cdr
 ```
 ```json
-{"entityName":"cdr","dataType":"long","shard":2,
- "segment":{"size":1000,"watermark":0.5,"loaded":true,"issued":4,"remaining":996,
-            "refillInFlight":false,"nextIteration":4,"reservedEnd":1000,"diskMark":1000,
-            "nextValue":"14","diskHighWaterMark":"3002"}}
+{"dataType":"long","entityName":"cdr","shard":2,"tenant":"btcl",
+ "segment":{"diskHighWaterMark":"3002","diskMark":1000,"issued":1,"loaded":true,"nextIteration":1,"nextValue":"5",
+            "refillInFlight":false,"remaining":999,"reservedEnd":1000,"size":1000,"watermark":0.5}}
 ```
 
 | Field | Meaning |
 |---|---|
 | `issued` | IDs handed out by this process since it loaded the entity |
-| `remaining` | IDs reserved in RAM, not yet handed out |
-| `refillInFlight` | the background reservation is writing the next block |
-| `nextIteration` / `reservedEnd` | the RAM window `[next, end)` this process owns |
-| `diskMark` | the durable mark; always above every ID handed out |
-| `nextValue`, `diskHighWaterMark` | the same positions as values (`int`/`long` only) |
+| `remaining` | reserved in RAM, not yet handed out |
+| `refillInFlight` | the next block is being written to disk |
+| `nextIteration`, `reservedEnd` | the window `[next, end)` this process owns |
+| `diskMark` | durable mark — always above every ID handed out |
 
-**Errors**: `404` unknown entity; `400` for `snowflake` (no reservations).
+`404` unknown entity, `400` for `snowflake` (no reservations).
 
 ---
 
-## GET /api/parse-snowflake/{id}
+## GET /api/v2/{tenant}/parse-snowflake/{id}
 
-Decode a Snowflake ID minted by any shard (pure arithmetic, uses `snowflake_epoch_ms`).
+Decode a Snowflake minted by any shard (Snowflake IDs are unique across the installation, whichever tenant asked):
 
 ```json
-{"id":"315240570203148288","timestamp":1779226511668,"date":"2026-05-19T21:35:11.668Z",
- "shardId":2,"sequence":0,"binary":"0000010001011111..."}
+{"binary":"0000010100110010111000110111111110110100010000000001000000000000","date":"2026-10-30T17:33:46.577Z",
+ "id":"374611856649621504","sequence":0,"shardId":2,"tenant":"btcl","timestamp":1793381626577}
 ```
 
-**Errors**: `400` if the path is not a valid 64-bit decimal.
+`400` if the id is not a valid 64-bit decimal.
 
----
+## GET /api/v2/{tenant}/types
+
+```json
+{"apiVersions":{"scalar":"GET /api/v2/{tenant}/next-id/{entity}?dataType=T — one ID",
+                "vector":"GET /api/v2/{tenant}/next-batch/{entity}?dataType=T&batchSize=N — N IDs (1..10000)"},
+ "availableTypes":["int","long","snowflake","uuid8","uuid12","uuid16","uuid22"],
+ "description":{"int":"Sequential 32-bit integer (shard 2: 2, 5, 8, ...)", "...":"..."},
+ "shardInfo":{"shardId":2,"totalShards":3},
+ "snowflakeInfo":{"epoch":"2024-01-01T00:00:00Z","maxIdsPerMs":4096,"maxShards":1024,
+                  "bitsAllocation":{"timestamp":41,"shardId":10,"sequence":12,"total":64}},"tenant":"btcl"}
+```
 
 ## GET /health
 
+Global (no tenant).
+
 ```json
-{"status":"healthy","uptime":12345.67,"shard":2,"totalShards":3,
- "snowflakeStats":{"generated":184213,"collisions":4,"waits":0,"shardId":2,"totalShards":3,"maxIdsPerMs":4096,"maxShards":1024}}
+{"shard":2,"snowflakeStats":{"collisions":0,"generated":1,"maxIdsPerMs":4096,"maxShards":1024,"shardId":2,"totalShards":3,"waits":0},
+ "status":"healthy","tenants":["acme","btcl"],"totalShards":3,"uptime":1.194490396}
 ```
 
 ## GET /shard-info
 
-Identity plus the values that **must be identical on every shard** of a cluster. Compare them
-across nodes after a deploy.
+Global. Identity plus the values that **must be identical on every shard** — compare them across nodes after a deploy:
+`totalShards`, `uuidKeyFingerprint`, `snowflakeEpochMs` and `tenants` (a caller rotates across shards; a tenant missing
+on one would be refused there). `legacyTenant`, `v1Calls` and `v1Callers` show the pre-tenant roads during the move.
 
 ```json
-{"shardId":2,"totalShards":3,"status":"active","uuidKeyFingerprint":"4179529caf32c8cc","snowflakeEpochMs":1704067200000}
+{"legacyTenant":"btcl","shardId":2,"snowflakeEpochMs":1704067200000,"status":"active","tenants":["acme","btcl"],
+ "totalShards":3,"uuidKeyFingerprint":"987a907e1b019511","v1Callers":{"127.0.0.1":1},"v1Calls":1}
 ```
 
-## GET /api/types
+## Pre-tenant roads
 
-Lists the types, a description of each, the two API versions and the Snowflake layout.
+The roads of the service before tenancy — `/api/next-id/{entity}`, `/api/next-batch/{entity}`, `/api/init/{entity}`,
+`/api/reset/{entity}`, `/api/status/{entity}`, `/api/segment-state/{entity}`, `/api/list`, `/api/types`,
+`/api/parse-snowflake/{id}` — stay while callers move, **switched by one config line**:
+
+| Config | The pre-tenant roads |
+|---|---|
+| `legacy_tenant: btcl` | act on tenant `btcl` and answer exactly as before tenancy (no `tenant` field); the same counters as `/api/v2/btcl/…` |
+| no `legacy_tenant` | answer `400 Tenant is required`, naming the v2 road to call; nothing is minted |
 
 ```json
-{"availableTypes":["int","long","snowflake","uuid8","uuid12","uuid16","uuid22"],
- "apiVersions":{"scalar":"GET /api/next-id/{entity}?dataType=T — one ID",
-                "vector":"GET /api/next-batch/{entity}?dataType=T&batchSize=N — N IDs (1..10000)"},
- "description":{"uuid8":"Unique 8-character alphanumeric string (shard-interleaved counter, keyed scramble)", "...":"..."},
- "shardInfo":{"shardId":2,"totalShards":3},
- "snowflakeInfo":{"epoch":"2024-01-01T00:00:00Z","maxIdsPerMs":4096,"maxShards":1024,
-                  "bitsAllocation":{"timestamp":41,"shardId":10,"sequence":12,"total":64}}}
+{"dataType":"int","entityName":"order","shard":2,"value":5}
+{"error":"Tenant is required","message":"this installation serves tenants by name: call /api/v2/{tenant}/next-id/partner.btcl"}
 ```
+
+Every pre-tenant call, served or refused, is counted per caller address (`v1Calls`, `v1Callers` on `/shard-info`) and
+logged once per caller per hour, so an operator sees who has not moved. One difference from before tenancy: a `uuid*`
+entity registered after the move gets the tenant's scramble; entities carried over keep theirs.
+
+More: [usage-examples.md](usage-examples.md) · tenancy and the move: [tenancy.md](tenancy.md)

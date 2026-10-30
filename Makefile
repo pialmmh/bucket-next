@@ -14,7 +14,7 @@ cli:
 	mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/bucket-next-cli ./cmd/bucket-next-cli
 
-# Local single-shard run; -init creates ./data/state.json on the first start only.
+# Local single-shard run; -init creates the state in ./data/shard-1 on the first start only (configs/sample.yaml).
 run: service
 	$(BIN_DIR)/bucket-next -config configs/sample.yaml -init
 

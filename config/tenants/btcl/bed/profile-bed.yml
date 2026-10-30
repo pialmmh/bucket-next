@@ -20,8 +20,21 @@ total_shards: 2
 listen_address: 10.10.188.2
 listen_port: 7001
 
-# One file per shard; initialised ONCE (--init-state on the first deploy) and never again after a mint.
-state_path: /var/lib/bucket-next/shard-{shard_id}/state.json
+# One directory per shard (shard.json + tenants/<tenant>.json); initialised ONCE (--init-state on the first deploy) and
+# never again after a mint. The pre-tenant state.json the bed's shard 1 holds in it is carried over into legacy_tenant at
+# the new binary's first start, every mark kept (docs/tenancy.md).
+state_dir: /var/lib/bucket-next/shard-{shard_id}
+
+# The tenants this installation serves (the owner, 2026-10-30: ONE id service per installation, the tenant a key on every
+# call; tenant-master's tenant id). One tenant today: btcl (both applications, ad-sphere and wifi-sphere, under it).
+# A second tenant = one more name here + a deploy: each shard creates its file at the next start.
+tenants: [btcl]
+
+# The pre-tenant roads (/api/next-id/{entity} and the rest) act on btcl while a caller still uses them: the bed's one
+# caller, prime-context-core-s2, mints partner.btcl through seed-idgen's v1 client until its round moves it to
+# /api/v2/btcl/. Watch v1Calls on /shard-info; when it stops moving, delete this line and deploy: those roads then
+# answer 400 "Tenant is required", in words. The same line names the owner of the carried-over state.json.
+legacy_tenant: btcl
 
 segment_size: 1000
 segment_refill_watermark: 0.5

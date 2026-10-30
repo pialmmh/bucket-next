@@ -14,12 +14,14 @@ environment-variable surface — every knob lives in the file.
 |---|---|---|
 | `shard_id` | int | This node's shard, in `[1, total_shards]`. Unique within the cluster. |
 | `total_shards` | int | Cluster size, in `[1, 1024]`. Identical on every node. |
-| `state_path` | string | This shard's own JSON state file. Parent dir is created automatically. |
+| `state_dir` | string | This shard's own state directory: `shard.json` + `tenants/<tenant>.json`. Created by `-init`. (The pre-tenant `state_path` is refused, naming `state_dir`.) |
+| `tenants` | list | The tenants this installation serves, e.g. `[btcl]` — tenant-master's tenant ids (`^[a-z][a-z0-9]{1,15}$`), no repeats. Identical on every node. A call never creates a tenant. |
 
 ## Optional keys (defaults shown)
 
 | Key | Default | Description |
 |---|---|---|
+| `legacy_tenant` | none | One of `tenants`. The pre-tenant roads (`/api/next-id/{entity}` …, no tenant) act on it, and a pre-tenant `state.json` found in `state_dir` is carried over into it. Unset = those roads answer `400 Tenant is required`, and a pre-tenant `state.json` is refused. See [tenancy.md](tenancy.md). |
 | `listen_address` | `""` | IP to bind. Empty = all interfaces. Use `127.0.0.1` on a dev box and the host's private IP on a server. Must be an IP literal (IPv4 or IPv6); hostnames are refused. |
 | `listen_port` | `7001` | HTTP port to bind. |
 | `segment_size` | `1000` | Counter IDs reserved per durable disk write. Bigger = fewer writes, bigger gap after a crash. |
@@ -35,7 +37,9 @@ shard_id: 2
 total_shards: 3
 listen_address: 10.10.199.12
 listen_port: 7001
-state_path: /var/lib/bucket-next/shard-2/state.json
+state_dir: /var/lib/bucket-next/shard-2
+tenants: [btcl, acme]
+legacy_tenant: btcl      # only while a caller still uses the pre-tenant roads
 
 segment_size: 1000
 segment_refill_watermark: 0.5
@@ -49,21 +53,29 @@ uuid_key: 0f1e2d3c4b5a69788796a5b4c3d2e1f0
 Config:
 - the file is missing or unparseable;
 - `shard_id` is outside `[1, total_shards]`, or `total_shards` outside `[1, 1024]`;
-- `listen_port` is outside `[1, 65535]`, or `state_path` is empty;
+- `listen_port` is outside `[1, 65535]`, `state_dir` is empty, or `state_path` is set (it is replaced by `state_dir`);
+- `tenants` is missing or empty, a tenant breaks `^[a-z][a-z0-9]{1,15}$`, a tenant is listed twice, or `legacy_tenant`
+  is not one of `tenants`;
 - `listen_address` is set but is not an IP address;
 - `segment_size < 1`, or `segment_refill_watermark` is not strictly between 0 and 1;
 - `uuid_key` is set but is not 32/48/64 hex chars.
 
-State file:
-- **it does not exist** and `-init` was not given (starting from zero would re-issue IDs);
-- it is empty or unparseable;
-- **it belongs to another identity** — its recorded `shard_id`, `total_shards`, uuid key
-  fingerprint or `snowflake_epoch_ms` differ from the config. Example:
+State:
+- **`state_dir` holds no state** and `-init` was not given (starting from zero would re-issue IDs);
+- a file is empty or unparseable;
+- **a file belongs to another identity** — the `shard_id`, `total_shards`, uuid key fingerprint or
+  `snowflake_epoch_ms` recorded in `shard.json` or a tenant file differ from the config. Example:
 
   ```
-  state: state file ./a.json does not belong to this config (shard_id: file=1 config=2);
-  using it would issue duplicate IDs — point state_path at this shard's own file, or fix the config
+  state: state file /var/lib/bucket-next/shard-1/shard.json does not belong to this config (total_shards: file=2 config=3);
+  using it would issue duplicate IDs — point state_dir at this shard's own directory, or fix the config
   ```
+- a tenant file holds another tenant (renamed or copied);
+- a tenant on the shard's roster has **lost its file** (restore it from backup);
+- a tenant not on the roster has a file with entities (`bucket-next-cli adopt-tenant <t>` after `shard.json` was
+  restored from an older backup);
+- `shard.json` is missing while tenant files exist (restore `shard.json`);
+- a pre-tenant `state.json` is present and no tenant owns it (`legacy_tenant`).
 
 Clock:
 - the clock is more than `1000 + clock_drift_tolerance_ms` ms behind the last Snowflake mark
@@ -71,15 +83,23 @@ Clock:
 
 On any of these it prints the reason and exits non-zero — it never half-starts.
 
-## The state file binds a shard's identity
+## The state binds a shard's identity
 
-On creation the state file records `shardId`, `totalShards`, `uuidKeyFingerprint` and
-`snowflakeEpochMs`. These four must never change for the life of the shard, because every ID
-already issued depends on them. To change any of them you need a planned migration (new
-state files and new entity names), not a config edit.
+```
+<state_dir>/shard.json          identity · Snowflake mark · the tenant roster · the last carry-over
+<state_dir>/tenants/<t>.json    tenant t · the same identity · its entities' marks (and each uuid entity's scramble)
+<state_dir>/.lock               held by the running service
+```
 
-Older state files (format v1, a bare JSON array) are upgraded automatically on first start,
-provided their records belong to this `shard_id`.
+On creation every file records `shardId`, `totalShards`, `uuidKeyFingerprint` and `snowflakeEpochMs`. These four must
+never change for the life of the shard, because every ID already issued depends on them. To change any of them you need a
+planned migration (new state and new entity names), not a config edit.
+
+A new tenant needs no step of its own: a tenant declared in `tenants` and not on the shard's roster gets its file at the
+next start, then joins the roster. A tenant on the roster whose file is missing is refused (lost), never begun afresh.
+
+A pre-tenant state file (`state_dir/state.json`, format 1 or 2) is carried over at the first start into
+`legacy_tenant`, every mark kept, then renamed `state.json.migrated-v<N>`: [tenancy.md](tenancy.md).
 
 ## Notes on specific keys
 
@@ -127,6 +147,6 @@ shard. Changing it later is refused at startup (fingerprint mismatch).
 
 ## Multi-shard configs
 
-Each shard gets its **own** config with its own `shard_id` and `state_path`, and the **same**
-`total_shards`, `uuid_key` and `snowflake_epoch_ms`. The deploy tooling renders these per-shard
+Each shard gets its **own** config with its own `shard_id` and `state_dir`, and the **same**
+`total_shards`, `tenants`, `uuid_key` and `snowflake_epoch_ms`. The deploy tooling renders these per-shard
 files for you — see [deployment.md](deployment.md).

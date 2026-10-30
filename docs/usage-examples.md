@@ -1,7 +1,7 @@
 # Usage examples
 
-Practical recipes. Assumes a service on `localhost:7001` (see
-[getting-started.md](getting-started.md)).
+Practical recipes. Assumes a service on `localhost:7001` serving tenant `btcl` (see
+[getting-started.md](getting-started.md)). Every call names its tenant first: `/api/v2/{tenant}/…`.
 
 ## Pick a data type
 
@@ -18,22 +18,22 @@ Each entity is bound to **one** type on first use, for life.
 
 | Version | Endpoint | Returns | Use when |
 |---|---|---|---|
-| Scalar | `GET /api/next-id/{entity}?dataType=T` | one ID | one record at a time |
-| Vector | `GET /api/next-batch/{entity}?dataType=T&batchSize=N` | N IDs (1..10 000) | bulk / high TPS — one round trip per block |
+| Scalar | `GET /api/v2/{tenant}/next-id/{entity}?dataType=T` | one ID | one record at a time |
+| Vector | `GET /api/v2/{tenant}/next-batch/{entity}?dataType=T&batchSize=N` | N IDs (1..10 000) | bulk / high TPS — one round trip per block |
 
 Both draw from the same counter, so mixing them never repeats an ID:
 
 ```bash
-curl "localhost:7001/api/next-id/x?dataType=int"                  # 1
-curl "localhost:7001/api/next-batch/x?dataType=int&batchSize=3"   # 2, 3, 4
-curl "localhost:7001/api/next-id/x?dataType=int"                  # 5
+curl "localhost:7001/api/v2/btcl/next-id/x?dataType=int"                  # 1
+curl "localhost:7001/api/v2/btcl/next-batch/x?dataType=int&batchSize=3"   # 2, 3, 4
+curl "localhost:7001/api/v2/btcl/next-id/x?dataType=int"                  # 5
 ```
 
 ## Sequential integers
 
 ```bash
-curl "localhost:7001/api/next-id/order?dataType=int"
-# {"dataType":"int","entityName":"order","shard":1,"value":1}
+curl "localhost:7001/api/v2/btcl/next-id/order?dataType=int"
+# {"dataType":"int","entityName":"order","shard":1,"tenant":"btcl","value":1}
 ```
 
 Single shard (`total_shards: 1`): `1, 2, 3, …`. Shard *k* of *N*: `k, k+N, k+2N, …` — see
@@ -42,8 +42,8 @@ Single shard (`total_shards: 1`): `1, 2, 3, …`. Shard *k* of *N*: `k, k+N, k+2
 ## Large sequential (long)
 
 ```bash
-curl "localhost:7001/api/next-id/cdr?dataType=long"
-# {"dataType":"long","entityName":"cdr","shard":1,"value":"1"}
+curl "localhost:7001/api/v2/btcl/next-id/cdr?dataType=long"
+# {"dataType":"long","entityName":"cdr","shard":1,"tenant":"btcl","value":"1"}
 ```
 
 `value` is a **string** for `long`; parse it as a 64-bit integer.
@@ -51,7 +51,7 @@ curl "localhost:7001/api/next-id/cdr?dataType=long"
 ## A range of numbers in one call
 
 ```bash
-curl "localhost:7001/api/next-batch/cdr?dataType=long&batchSize=5000"
+curl "localhost:7001/api/v2/btcl/next-batch/cdr?dataType=long&batchSize=5000"
 # {..., "startValue":"2","endValue":"14999",
 #  "range":{"first":"2","last":"14999","step":3,"count":5000}, "values":[...]}
 ```
@@ -62,9 +62,9 @@ store `range` alone: value *i* = `first + i × step`.
 ## Unique short strings (uuid)
 
 ```bash
-curl "localhost:7001/api/next-id/session?dataType=uuid16"
-# {"dataType":"uuid16","entityName":"session","shard":1,"value":"oKs4845oCMOV3Qhm"}
-curl "localhost:7001/api/next-batch/sms-id?dataType=uuid8&batchSize=1000"
+curl "localhost:7001/api/v2/btcl/next-id/session?dataType=uuid16"
+# {"dataType":"uuid16","entityName":"session","shard":1,"tenant":"btcl","value":"oKs4845oCMOV3Qhm"}
+curl "localhost:7001/api/v2/btcl/next-batch/sms-id?dataType=uuid8&batchSize=1000"
 ```
 
 `uuid8/12/16/22` differ only in length. They are **not random**: each is the entity's counter
@@ -81,15 +81,15 @@ crashes.
 ## Time-ordered Snowflake
 
 ```bash
-ID=$(curl -s "localhost:7001/api/next-id/event?dataType=snowflake" | jq -r .value)
-curl -s "localhost:7001/api/parse-snowflake/$ID"
+ID=$(curl -s "localhost:7001/api/v2/btcl/next-id/event?dataType=snowflake" | jq -r .value)
+curl -s "localhost:7001/api/v2/btcl/parse-snowflake/$ID"
 # {"id":"...","timestamp":...,"date":"2026-05-19T21:35:11.668Z","shardId":1,"sequence":0,...}
 ```
 
 ## Seed a starting value
 
 ```bash
-curl -X POST localhost:7001/api/init/invoice \
+curl -X POST localhost:7001/api/v2/btcl/init/invoice \
   -H 'Content-Type: application/json' -d '{"dataType":"long","startValue":1000}'
 ```
 
@@ -104,22 +104,22 @@ entity's counter above IDs that already exist, do it on **every** shard that min
 
 ```bash
 # forward — always allowed
-curl -X PUT localhost:7001/api/reset/order -H 'Content-Type: application/json' -d '{"value":5000}'
+curl -X PUT localhost:7001/api/v2/btcl/reset/order -H 'Content-Type: application/json' -d '{"value":5000}'
 
 # backward — refused (409), because IDs could repeat
-curl -X PUT localhost:7001/api/reset/order -H 'Content-Type: application/json' -d '{"value":2}'
+curl -X PUT localhost:7001/api/v2/btcl/reset/order -H 'Content-Type: application/json' -d '{"value":2}'
 
 # backward on purpose (you know those IDs are unused)
-curl -X PUT localhost:7001/api/reset/order -H 'Content-Type: application/json' -d '{"value":2,"force":true}'
+curl -X PUT localhost:7001/api/v2/btcl/reset/order -H 'Content-Type: application/json' -d '{"value":2,"force":true}'
 ```
 
 ## Inspect state
 
 ```bash
-curl localhost:7001/api/status/order          # one entity
-curl localhost:7001/api/list                  # all entities
-curl localhost:7001/api/segment-state/order   # RAM reservation (int/long/uuid*)
-curl localhost:7001/shard-info                # identity; compare across shards
+curl localhost:7001/api/v2/btcl/status/order          # one entity
+curl localhost:7001/api/v2/btcl/list                  # all entities
+curl localhost:7001/api/v2/btcl/segment-state/order   # RAM reservation (int/long/uuid*)
+curl localhost:7001/shard-info                # identity + served tenants; compare across shards
 ```
 
 ## Multi-shard numbering
@@ -132,8 +132,8 @@ Three shards, each owning a residue class — no coordination, no collisions:
 | 2 of 3 | 2, 5, 8, 11, … |
 | 3 of 3 | 3, 6, 9, 12, … |
 
-A client may call any shard (round-robin, nearest…); every ID is unique for its entity across
-the cluster. `uuid*` follow the same rule; `snowflake` carries the shard id in its bits.
+A client may call any shard (round-robin, nearest…); every ID is unique for its tenant's entity
+across the cluster. Each tenant's counters are interleaved the same way. `uuid*` follow the same rule; `snowflake` carries the shard id in its bits.
 
 ## Gaps and crash behaviour
 
@@ -148,14 +148,27 @@ Counter types reserve `segment_size` IDs (default 1000) on disk in one durable w
   passes it (≤ ~1 s), so no Snowflake repeats either.
 - Lower `segment_size` for a low-volume entity if gaps look untidy.
 
+## Two tenants, one installation
+
+```bash
+curl "localhost:7001/api/v2/btcl/next-id/order?dataType=int"   # 1
+curl "localhost:7001/api/v2/acme/next-id/order?dataType=int"   # 1  — acme's own counter
+curl "localhost:7001/api/v2/btcl/next-id/order?dataType=int"   # 2
+```
+
+The same entity name in two tenants is two counters. `int`/`long` values overlap across tenants on purpose; `uuid*`
+strings do not follow each other (the scramble includes the tenant); `snowflake` is unique installation-wide.
+
 ## Language snippets
+
+Every snippet takes the tenant from its caller: there is no default tenant in a client either.
 
 ### bash + jq
 
 ```bash
-next_id()  { curl -s "http://localhost:7001/api/next-id/$1?dataType=$2" | jq -r .value; }
-next_ids() { curl -s "http://localhost:7001/api/next-batch/$1?dataType=$2&batchSize=$3" | jq -r '.values[]'; }
-order_id=$(next_id order long)
+next_id()  { curl -s "http://localhost:7001/api/v2/$1/next-id/$2?dataType=$3" | jq -r .value; }
+next_ids() { curl -s "http://localhost:7001/api/v2/$1/next-batch/$2?dataType=$3&batchSize=$4" | jq -r '.values[]'; }
+order_id=$(next_id btcl order long)
 ```
 
 ### Python
@@ -165,25 +178,25 @@ import requests
 
 BASE = "http://localhost:7001"
 
-def next_id(entity, dtype):
-    r = requests.get(f"{BASE}/api/next-id/{entity}", params={"dataType": dtype})
+def next_id(tenant, entity, dtype):
+    r = requests.get(f"{BASE}/api/v2/{tenant}/next-id/{entity}", params={"dataType": dtype})
     r.raise_for_status()
     return r.json()["value"]   # str for long/snowflake/uuid*, int for int
 
-def next_ids(entity, dtype, n):
-    r = requests.get(f"{BASE}/api/next-batch/{entity}", params={"dataType": dtype, "batchSize": n})
+def next_ids(tenant, entity, dtype, n):
+    r = requests.get(f"{BASE}/api/v2/{tenant}/next-batch/{entity}", params={"dataType": dtype, "batchSize": n})
     r.raise_for_status()
     return r.json()["values"]
 
-order_id = next_id("order", "long")
-sms_ids = next_ids("sms-id", "uuid12", 5000)
+order_id = next_id("btcl", "order", "long")
+sms_ids = next_ids("btcl", "sms-id", "uuid12", 5000)
 ```
 
 ### Go
 
 ```go
-func nextIDs(base, entity, dtype string, n int) ([]any, error) {
-	u := fmt.Sprintf("%s/api/next-batch/%s?dataType=%s&batchSize=%d", base, entity, url.QueryEscape(dtype), n)
+func nextIDs(base, tenant, entity, dtype string, n int) ([]any, error) {
+	u := fmt.Sprintf("%s/api/v2/%s/next-batch/%s?dataType=%s&batchSize=%d", base, tenant, entity, url.QueryEscape(dtype), n)
 	resp, err := http.Get(u)
 	if err != nil {
 		return nil, err
@@ -200,8 +213,8 @@ func nextIDs(base, entity, dtype string, n int) ([]any, error) {
 ### Node.js
 
 ```js
-async function nextId(entity, dtype, base = "http://localhost:7001") {
-  const r = await fetch(`${base}/api/next-id/${entity}?dataType=${dtype}`);
+async function nextId(tenant, entity, dtype, base = "http://localhost:7001") {
+  const r = await fetch(`${base}/api/v2/${tenant}/next-id/${entity}?dataType=${dtype}`);
   if (!r.ok) throw new Error(`bucket-next ${r.status}`);
   return (await r.json()).value;   // string for long/snowflake/uuid*
 }

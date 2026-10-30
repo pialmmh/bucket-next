@@ -30,7 +30,8 @@ shard_id: 1
 total_shards: 1
 listen_address: 127.0.0.1    # loopback only — the API has no authentication
 listen_port: 7001
-state_path: ./data/state.json
+state_dir: ./data/shard-1
+tenants: [btcl]              # the tenants this installation serves; every call names one
 EOF
 ```
 
@@ -39,20 +40,30 @@ should set before using `uuid*` types in production).
 
 ## 3. First start — with `-init`
 
-A brand-new shard has no state file yet. Start it **once** with `-init` to create one:
+A brand-new shard has no state yet. Start it **once** with `-init` to create it:
 
 ```bash
 ./bin/bucket-next -config my.yaml -init
 ```
 
 ```
-created new state file ./data/state.json for shard 1/1
-bucket-next listening on 127.0.0.1:7001  shard=1/1  state=./data/state.json
+state ./data/shard-1: create the state of a brand-new shard 1/1
+state ./data/shard-1: create tenant btcl: declared, not on the roster yet
+bucket-next listening on 127.0.0.1:7001  shard=1/1  tenants=btcl  legacy_tenant=""  state=./data/shard-1
 ```
 
-Every later start is **without** `-init`. If the state file is ever missing, the service
-refuses to start instead of starting from zero (which would re-issue old IDs). `-init` only
-creates a file that does not exist; it never touches an existing one.
+Every later start is **without** `-init`. If the state is ever missing, the service refuses to start instead of
+starting from zero (which would re-issue old IDs):
+
+```
+state not found: state_dir ./data/shard-1 does not exist
+Refusing to start: starting from zero would re-issue IDs.
+If this is a brand-new shard, start it once with -init (or run: bucket-next-cli -config my.yaml init-state).
+If the state was lost, restore it from backup instead.
+```
+
+`-init` only creates state that does not exist; it never touches existing state. A tenant added to `tenants` later
+needs no `-init`: the shard creates its file at the next start.
 
 > A `WARNING: uuid_key is not set` line is expected in a quick test. It means uuid IDs are
 > unique but predictable. Set `uuid_key` before production use.
@@ -65,27 +76,31 @@ In a second terminal:
 curl http://localhost:7001/health
 
 # scalar — one sequential integer for entity "order"
-curl "http://localhost:7001/api/next-id/order?dataType=int"
-# {"dataType":"int","entityName":"order","shard":1,"value":1}
+curl "http://localhost:7001/api/v2/btcl/next-id/order?dataType=int"
+# {"dataType":"int","entityName":"order","shard":1,"tenant":"btcl","value":1}
 
-curl "http://localhost:7001/api/next-id/order?dataType=int"
-# {"dataType":"int","entityName":"order","shard":1,"value":2}
+curl "http://localhost:7001/api/v2/btcl/next-id/order?dataType=int"
+# {"dataType":"int","entityName":"order","shard":1,"tenant":"btcl","value":2}
 
 # vector — a range of 5 in one call
-curl "http://localhost:7001/api/next-batch/order?dataType=int&batchSize=5"
-# {"batchSize":5,"startValue":3,"endValue":7,"values":[3,4,5,6,7],
-#  "range":{"first":3,"last":7,"step":1,"count":5}, ...}
+curl "http://localhost:7001/api/v2/btcl/next-batch/order?dataType=int&batchSize=5"
+# {"batchSize":5,"dataType":"int","endValue":7,"entityName":"order","range":{"first":3,"last":7,"step":1,"count":5},
+#  "shard":1,"startValue":3,"tenant":"btcl","values":[3,4,5,6,7]}
+
+# a tenant this installation does not serve is refused, in words — never a default tenant
+curl "http://localhost:7001/api/v2/nobody/next-id/order?dataType=int"
+# {"error":"Unknown tenant","message":"tenant 'nobody' is not served by this installation (served tenants: btcl)"}
 
 # a unique 12-character string for entity "token"
-curl "http://localhost:7001/api/next-id/token?dataType=uuid12"
-# {"dataType":"uuid12","entityName":"token","shard":1,"value":"3KpZ8qWbT0xa"}
+curl "http://localhost:7001/api/v2/btcl/next-id/token?dataType=uuid12"
+# {"dataType":"uuid12","entityName":"token","shard":1,"tenant":"btcl","value":"3KpZ8qWbT0xa"}
 
 # a time-ordered 64-bit Snowflake for entity "event"
-curl "http://localhost:7001/api/next-id/event?dataType=snowflake"
-# {"dataType":"snowflake","entityName":"event","shard":1,"value":"315240570203148288"}
+curl "http://localhost:7001/api/v2/btcl/next-id/event?dataType=snowflake"
+# {"dataType":"snowflake","entityName":"event","shard":1,"tenant":"btcl","value":"315240570203148288"}
 ```
 
-Each entity registered itself on the first call and is now bound to that data type.
+Each entity registered itself in tenant `btcl` on the first call and is now bound to that data type.
 
 ## 5. Stop it
 

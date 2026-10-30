@@ -6,7 +6,12 @@ total_shards: 2
 # its one client is the production prime-context on the same box; review the bind with the owner before the first deploy
 listen_address: 127.0.0.1
 listen_port: 7001
-state_path: /var/lib/bucket-next/shard-{shard_id}/state.json
+state_dir: /var/lib/bucket-next/shard-{shard_id}
+
+# one id service per installation, serving every tenant (see ../bed/profile-bed.yml)
+tenants: [btcl]
+# No legacy_tenant: a fresh installation serves the tenant-first roads only, so a call without a tenant is refused in words.
+# Add "legacy_tenant: btcl" for the first deploy only if a production caller still uses the pre-tenant roads then.
 
 segment_size: 10000
 segment_refill_watermark: 0.5
