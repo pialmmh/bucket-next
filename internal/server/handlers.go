@@ -204,6 +204,7 @@ func (s *Server) handleShardInfo(w http.ResponseWriter, r *http.Request) {
 	if s.legacy != nil {
 		legacy = s.legacy.name
 	}
+	calls, callers := s.v1Calls.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"shardId":            s.cfg.ShardID,
 		"totalShards":        s.cfg.TotalShards,
@@ -212,6 +213,8 @@ func (s *Server) handleShardInfo(w http.ResponseWriter, r *http.Request) {
 		"snowflakeEpochMs":   s.cfg.SnowflakeEpochMs,
 		"tenants":            s.served,
 		"legacyTenant":       legacy,
+		"v1Calls":            calls,
+		"v1Callers":          callers,
 	})
 }
 

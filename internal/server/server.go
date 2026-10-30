@@ -29,6 +29,8 @@ type Server struct {
 	tenants   map[string]*tenant
 	served    []string // the served tenants, sorted
 	legacy    *tenant  // the tenant the pre-tenant roads act on; nil = those roads are refused
+	v1Calls   v1Calls
+	roads     map[string]v2Road
 	layout    shardmath.Layout
 	forge     *forge.Forge
 	codec     *uuidgen.Codec
@@ -64,6 +66,8 @@ func New(cfg *config.Config, l *state.Layout, f *forge.Forge, codec *uuidgen.Cod
 	if cfg.LegacyTenant != "" {
 		s.legacy = s.tenants[cfg.LegacyTenant]
 	}
+	s.v1Calls.callers = map[string]*v1Caller{}
+	s.roads = s.v2Roads()
 	s.routes()
 	s.httpsrv = &http.Server{
 		Addr:              cfg.ListenAddr(),
@@ -77,6 +81,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/health", methodOnly(http.MethodGet, s.handleHealth))
 	s.mux.HandleFunc("/shard-info", methodOnly(http.MethodGet, s.handleShardInfo))
 
+	// The tenant-first roads: /api/v2/{tenant}/{road}[/{arg}], the tenant mandatory.
+	s.mux.HandleFunc("/api/v2/", s.handleV2)
+	s.mux.HandleFunc("/api/v2", s.handleV2)
+
 	// The pre-tenant roads: no tenant in the path, on legacy_tenant only.
 	s.v1("/api/types", http.MethodGet, s.types)
 	s.v1("/api/list", http.MethodGet, s.list)
@@ -87,19 +95,6 @@ func (s *Server) routes() {
 	s.v1("/api/status/", http.MethodGet, s.status)
 	s.v1("/api/segment-state/", http.MethodGet, s.segmentState)
 	s.v1("/api/parse-snowflake/", http.MethodGet, s.parseSnowflake)
-}
-
-// v1 registers a pre-tenant road. It answers exactly as before tenancy, on legacy_tenant;
-// with no legacy_tenant it refuses, naming the tenant-first road to call instead.
-func (s *Server) v1(prefix, method string, h road) {
-	s.mux.HandleFunc(prefix, methodOnly(method, func(w http.ResponseWriter, r *http.Request) {
-		if s.legacy == nil {
-			writeError(w, http.StatusBadRequest, "Tenant is required",
-				"this installation serves tenants by name: call /api/v2/{tenant}/"+strings.TrimPrefix(r.URL.Path, "/api/"))
-			return
-		}
-		h(&call{w: w, r: r, t: s.legacy}, strings.TrimPrefix(r.URL.Path, prefix))
-	}))
 }
 
 func (s *Server) ListenAndServe() error {
